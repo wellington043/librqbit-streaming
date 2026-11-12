@@ -30,6 +30,13 @@ The default workspace selects the library. The minimal build excludes the HTTP s
 
 Applications should pin a reviewed Git commit from this fork and use `default-features = false, features = ["rust-tls"]`. The upstream package version remains 9.1.0; `librqbit::LOCAL_REVISION` identifies this fork's API revision. This repository does not publish under the upstream crate's crates.io identity.
 
+The first validated streaming source revision can be consumed with:
+
+```toml
+[dependencies]
+librqbit = { git = "https://github.com/wellington043/librqbit-streaming", rev = "5db5a8079ebf3e7911019c835ea049bbc3fab906", default-features = false, features = ["rust-tls"] }
+```
+
 ## Documentation
 
 - [Streaming API and semantics](docs/streaming/api.md)

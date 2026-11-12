@@ -70,5 +70,5 @@ Files: `torrent_state/live/mod.rs`, `live/peer/mod.rs`, `live/peer/stats/snapsho
 - [x] Add an external-consumer API example and real loopback multi-peer streaming tests.
 - [x] Review the complete diff once; fix concrete findings with focused checks.
 - [x] Run one consolidated library validation: formatting of changed files, cargo check, clippy, library tests, external API test and minimal release build. Preserve logs outside tracked source.
-- [ ] Commit only fork-owned files; push the feature branch and make it the fork default after verification.
-- [ ] Verify the public repo's parent, branch, commit and CI state; report proven limits and follow-up integration work.
+- [x] Commit only fork-owned files; push the feature branch and make it the fork default after verification.
+- [x] Verify the public repo's parent, branch, commit and CI state; report proven limits and follow-up integration work.

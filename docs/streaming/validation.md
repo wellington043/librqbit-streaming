@@ -70,6 +70,13 @@ not a measured binary-size or runtime-speed improvement.
 These checks do not establish public-swarm performance, long-session stability,
 first-frame latency, HDR, Android support or production PostgreSQL behavior.
 The HTTP adapter and the PostgreSQL persistence code were compile-checked as
-optional features; live database behavior requires its own environment. The
-Linux GitHub Actions workflow provides a separate platform check; its exact run
-status must be read from the repository's Actions page.
+optional features; live database behavior requires its own environment.
+
+## Linux CI
+
+[Streaming library run 43319303129](https://github.com/wellington043/librqbit-streaming/actions/runs/43319303129)
+passed on source commit `5db5a8079ebf3e7911019c835ea049bbc3fab906`:
+optional HTTP compilation, Clippy, library/external/documentation tests and the
+minimal release build. PostgreSQL was covered by the local compile above, not
+by this Linux workflow. Subsequent publication-evidence changes are documentation
+only and do not require another source test run.
