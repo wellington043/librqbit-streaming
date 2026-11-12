@@ -1,3 +1,5 @@
+// Modified for WebTorrent Desktop streaming phase 3.
+
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
@@ -274,6 +276,11 @@ pub struct AddTorrentOptions {
     pub sub_folder: Option<String>,
     /// Peer connection options, timeouts etc. If not set, session's defaults will be used.
     pub peer_opts: Option<PeerConnectionOptions>,
+
+    /// Download only pieces intersecting active stream windows and enable guarded
+    /// recovery after a productive outgoing connection loses its transport.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub demand_only_streaming: bool,
 
     /// Force a refresh interval for polling trackers.
     pub force_tracker_interval: Option<Duration>,
@@ -1364,6 +1371,7 @@ impl Session {
                     peer_connect_timeout: peer_opts.connect_timeout,
                     peer_read_write_timeout: peer_opts.read_write_timeout,
                     peer_max_request_window: peer_opts.max_request_window,
+                    demand_only_streaming: opts.demand_only_streaming,
                     allow_overwrite: opts.overwrite,
                     output_folder,
                     ratelimits: opts.ratelimits,

@@ -1,8 +1,12 @@
+// Modified for WebTorrent Desktop streaming phase 3.
+
+pub mod request_flow;
 pub mod stats;
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, atomic::Ordering};
+use std::time::Instant;
 
 use librqbit_core::hash_id::Id20;
 use librqbit_core::lengths::{ChunkInfo, ValidPieceIndex};
@@ -12,12 +16,14 @@ use tokio::sync::{
     Notify,
     mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
 };
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::peer_connection::WriterRequest;
 use crate::stream_connect::ConnectionKind;
 use crate::type_aliases::BF;
 
+use self::request_flow::{AdaptiveRequestWindow, PeerRequestFlowSnapshot};
 use super::PeerStates;
 
 pub(crate) type InflightRequest = ChunkInfo;
@@ -30,6 +36,7 @@ pub(crate) struct Peer {
     state: PeerState,
     pub stats: stats::atomic::PeerStats,
     pub outgoing_address: Option<SocketAddr>,
+    pub stream_retry: Option<CancellationToken>,
 }
 
 impl Peer {
@@ -49,6 +56,7 @@ impl Peer {
             state,
             stats: Default::default(),
             outgoing_address: None,
+            stream_retry: None,
         }
     }
 
@@ -56,6 +64,7 @@ impl Peer {
         Self {
             addr,
             outgoing_address: Some(addr),
+            stream_retry: None,
             stats: Default::default(),
             state: Default::default(),
         }
@@ -152,6 +161,11 @@ impl Peer {
     }
 
     pub fn set_state(&mut self, new: PeerState, counters: &PeerStates) -> PeerState {
+        if !matches!(new, PeerState::Dead)
+            && let Some(retry) = self.stream_retry.take()
+        {
+            retry.cancel();
+        }
         for counter in [&counters.session_stats, &counters.stats] {
             counter.incdec(&self.state, &new);
         }
@@ -256,6 +270,7 @@ pub(crate) struct LivePeerState {
     pub client_name: Option<String>,
 
     pub peer_interested: bool,
+    pub stream_unchoked: bool,
 
     // This is used to track the pieces the peer has.
     pub bitfield: BF,
@@ -268,6 +283,9 @@ pub(crate) struct LivePeerState {
 
     // When the peer sends us data this is used to track if we asked for it.
     inflight_requests: HashSet<InflightRequest>,
+
+    // Allocated only for torrents using the streaming opt-in.
+    request_flow: Option<AdaptiveRequestWindow>,
 
     // Bounded tolerance for chunks that arrive after we cancel requests.
     // This is intentionally approximate: we track a count instead of storing every
@@ -293,9 +311,11 @@ impl LivePeerState {
             peer_id,
             client_name: None,
             peer_interested: initial_interested,
+            stream_unchoked: false,
             bitfield: BF::default(),
             seeder: false,
             inflight_requests: Default::default(),
+            request_flow: None,
             late_cancelled_request_tolerance: 0,
             request_slots_changed: Default::default(),
             tx,
@@ -316,11 +336,34 @@ impl LivePeerState {
     }
 
     pub fn add_inflight_request(&mut self, chunk: ChunkInfo) -> bool {
-        self.inflight_requests.insert(chunk)
+        let added = self.inflight_requests.insert(chunk);
+        if added && let Some(flow) = self.request_flow.as_mut() {
+            flow.on_request(chunk, Instant::now());
+        }
+        added
+    }
+
+    pub fn streaming_request_window(&mut self, limit: usize, now: Instant) -> usize {
+        let flow = self
+            .request_flow
+            .get_or_insert_with(|| AdaptiveRequestWindow::new(limit));
+        flow.set_limit(limit);
+        flow.window(now)
+    }
+
+    pub fn request_flow_snapshot(&self) -> Option<PeerRequestFlowSnapshot> {
+        self.request_flow.as_ref().map(|flow| {
+            let mut snapshot = flow.snapshot(Instant::now());
+            snapshot.inflight_requests = self.inflight_requests.len();
+            snapshot
+        })
     }
 
     pub fn remove_inflight_request(&mut self, chunk: &ChunkInfo) -> RemoveInflightRequestResult {
         if self.inflight_requests.remove(chunk) {
+            if let Some(flow) = self.request_flow.as_mut() {
+                flow.on_response(chunk, Instant::now());
+            }
             self.request_slots_changed.notify_waiters();
             return RemoveInflightRequestResult::Expected;
         }
@@ -336,6 +379,9 @@ impl LivePeerState {
     }
 
     pub fn cancel_inflight_requests_for_piece(&mut self, piece: ValidPieceIndex) {
+        if let Some(flow) = self.request_flow.as_mut() {
+            flow.cancel_piece(piece);
+        }
         let tx = &self.tx;
         let late_cancelled_request_tolerance = &mut self.late_cancelled_request_tolerance;
         let before = self.inflight_requests.len();
@@ -346,7 +392,8 @@ impl LivePeerState {
                     begin: req.offset,
                     length: req.size,
                 })));
-                *late_cancelled_request_tolerance += 1;
+                *late_cancelled_request_tolerance =
+                    late_cancelled_request_tolerance.saturating_add(1);
                 false
             } else {
                 true
@@ -371,4 +418,73 @@ pub(crate) enum RemoveInflightRequestResult {
     Expected,
     LateCanceled,
     Unexpected,
+}
+
+#[cfg(test)]
+mod streaming_flow_tests {
+    use super::*;
+    use librqbit_core::lengths::Lengths;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn streaming_flow_cancellation_frees_slots_and_ignores_late_sample() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut live = LivePeerState::new(Id20::default(), tx, false, ConnectionKind::Tcp);
+        let lengths = Lengths::new(32768, 32768).unwrap();
+        let piece = lengths.validate_piece_index(0).unwrap();
+        let chunks: Vec<_> = lengths.iter_chunk_infos(piece).collect();
+        live.streaming_request_window(2, Instant::now());
+        for chunk in &chunks {
+            assert!(live.add_inflight_request(*chunk));
+        }
+        let notify = live.request_slots_changed();
+        let changed = notify.notified();
+        live.cancel_inflight_requests_for_piece(piece);
+        tokio::time::timeout(Duration::from_millis(50), changed)
+            .await
+            .unwrap();
+        assert_eq!(live.requested_inflight_count(), 0);
+        let mut cancelled = HashSet::new();
+        for _ in &chunks {
+            let WriterRequest::Message(Message::Cancel(req)) = rx.try_recv().unwrap() else {
+                panic!("expected cancel")
+            };
+            cancelled.insert((req.index, req.begin, req.length));
+        }
+        for chunk in &chunks {
+            assert!(cancelled.contains(&(0, chunk.offset, chunk.size)));
+            assert!(matches!(
+                live.remove_inflight_request(chunk),
+                RemoveInflightRequestResult::LateCanceled
+            ));
+        }
+        assert!(
+            live.request_flow_snapshot()
+                .unwrap()
+                .response_latency_ms
+                .is_none()
+        );
+        assert!(matches!(
+            live.remove_inflight_request(&chunks[0]),
+            RemoveInflightRequestResult::Unexpected
+        ));
+        assert!(live.add_inflight_request(chunks[0]));
+    }
+
+    #[test]
+    fn non_streaming_peer_does_not_enable_adaptive_measurements() {
+        let (tx, _rx) = unbounded_channel();
+        let mut live = LivePeerState::new(Id20::default(), tx, false, ConnectionKind::Tcp);
+        let lengths = Lengths::new(16384, 16384).unwrap();
+        let chunk = lengths
+            .iter_chunk_infos(lengths.validate_piece_index(0).unwrap())
+            .next()
+            .unwrap();
+        assert!(live.add_inflight_request(chunk));
+        assert!(matches!(
+            live.remove_inflight_request(&chunk),
+            RemoveInflightRequestResult::Expected
+        ));
+        assert!(live.request_flow_snapshot().is_none());
+    }
 }

@@ -1,3 +1,5 @@
+// Modified for WebTorrent Desktop streaming phase 3.
+
 use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 
 use dashmap::DashMap;
@@ -14,6 +16,7 @@ use self::stats::{AggregatePeerStats, AggregatePeerStatsAtomic};
 
 use super::peer::{LivePeerState, Peer, PeerRx, PeerState, PeerTx};
 
+pub mod availability;
 pub mod stats;
 
 pub(crate) struct PeerStates {
@@ -84,7 +87,10 @@ impl PeerStates {
     }
 
     pub fn drop_peer(&self, handle: PeerHandle) -> Option<Peer> {
-        let p = self.states.remove(&handle).map(|r| r.1)?;
+        let mut p = self.states.remove(&handle).map(|r| r.1)?;
+        if let Some(retry) = p.stream_retry.take() {
+            retry.cancel();
+        }
         let s = p.get_state();
         self.stats.dec(s);
         self.session_stats.dec(s);
@@ -307,5 +313,80 @@ mod tests {
 
         peers.drop_peer(a).unwrap();
         assert_eq!(live_seeders(&peers), (1, 1));
+    }
+
+    #[test]
+    fn streaming_availability_uses_union_for_disjoint_and_overlapping_peers() {
+        let peers = make_peer_states();
+        let (a, _rx_a) = add_live_peer(&peers, "127.0.0.1:1234");
+        let (b, _rx_b) = add_live_peer(&peers, "127.0.0.1:1235");
+        peers.update_bitfield(
+            a,
+            BF::from_boxed_slice(vec![0b1100_0000].into_boxed_slice()),
+            8,
+        );
+        peers.update_bitfield(
+            b,
+            BF::from_boxed_slice(vec![0b0011_0000].into_boxed_slice()),
+            8,
+        );
+        let first = peers.region_availability(0..8, 8).unwrap();
+        assert_eq!((first.available_pieces, first.missing_pieces), (4, 4));
+        peers.update_bitfield(
+            b,
+            BF::from_boxed_slice(vec![0b0110_0000].into_boxed_slice()),
+            8,
+        );
+        let overlap = peers.region_availability(0..8, 8).unwrap();
+        assert_eq!((overlap.available_pieces, overlap.missing_pieces), (3, 5));
+        assert_eq!(overlap.connected_peers, 2);
+        assert_eq!(overlap.view, availability::PeerAvailabilityView::Observed);
+    }
+
+    #[test]
+    fn streaming_availability_masks_padding_and_reports_unknown_views() {
+        let peers = make_peer_states();
+        let (a, _rx_a) = add_live_peer(&peers, "127.0.0.1:1234");
+        assert_eq!(
+            peers.region_availability(0..5, 5).unwrap().view,
+            availability::PeerAvailabilityView::Unknown
+        );
+        peers.update_bitfield(
+            a,
+            BF::from_boxed_slice(vec![0b1000_0111].into_boxed_slice()),
+            5,
+        );
+        let (b, _rx_b) = add_live_peer(&peers, "127.0.0.1:1235");
+        let partial = peers.region_availability(0..5, 5).unwrap();
+        assert_eq!((partial.available_pieces, partial.missing_pieces), (1, 4));
+        assert_eq!(partial.view, availability::PeerAvailabilityView::Partial);
+        assert_eq!(partial.peers_with_known_bitfield, 1);
+        peers.drop_peer(b).unwrap();
+        assert_eq!(
+            peers.region_availability(1..5, 5).unwrap().available_pieces,
+            0
+        );
+    }
+
+    #[test]
+    fn streaming_availability_rejects_invalid_and_unbounded_regions() {
+        let peers = make_peer_states();
+        // Deliberately invalid API input, not a range intended for iteration.
+        let reversed = std::ops::Range { start: 4, end: 3 };
+        assert!(matches!(
+            peers.region_availability(reversed, 8),
+            Err(availability::PeerAvailabilityError::InvalidPieceRange)
+        ));
+        assert!(matches!(
+            peers.region_availability(0..9, 8),
+            Err(availability::PeerAvailabilityError::InvalidPieceRange)
+        ));
+        assert!(matches!(
+            peers.region_availability(0..4097, 4097),
+            Err(availability::PeerAvailabilityError::RegionTooLarge { .. })
+        ));
+        let empty = peers.region_availability(8..8, 8).unwrap();
+        assert_eq!((empty.available_pieces, empty.missing_pieces), (0, 0));
+        assert_eq!(empty.view, availability::PeerAvailabilityView::Unknown);
     }
 }

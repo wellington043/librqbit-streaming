@@ -1,3 +1,5 @@
+// Modified for WebTorrent Desktop streaming phase 3.
+
 use std::{
     sync::{
         Arc,
@@ -6,7 +8,7 @@ use std::{
     time::Instant,
 };
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 
 use rand::{RngExt, seq::IteratorRandom};
 use size_format::SizeFormatterBinary as SF;
@@ -24,6 +26,10 @@ use crate::{
 const MAX_FASTRESUME_CHECKS: usize = 64;
 
 use super::{ManagedTorrentShared, TorrentMetadata, paused::TorrentStatePaused};
+
+#[cfg(test)]
+#[path = "resume_tests.rs"]
+mod resume_tests;
 
 pub struct TorrentStateInitializing {
     pub(crate) files: FileStorage,
@@ -83,92 +89,140 @@ impl TorrentStateInitializing {
         self.check_running.store(false, Ordering::Release);
     }
 
+    // A rejected disk-backed value may still flush on Drop. Clear its snapshot
+    // before dropping it, then remove the persisted value before a full check.
+    async fn discard_fastresume(&self, bitv_factory: &dyn BitVFactory, mut hp: Box<dyn BitV>) {
+        hp.as_slice_mut().fill(false);
+        drop(hp);
+        if let Err(e) = bitv_factory.clear(self.shared.info_hash.into()).await {
+            warn!(id=?self.shared.id, info_hash = ?self.shared.info_hash, "error clearing bitfield: {e:#}");
+        }
+        self.checked_bytes.store(0, Ordering::Relaxed);
+    }
+
     async fn validate_fastresume(
         &self,
         bitv_factory: &dyn BitVFactory,
         have_pieces: Option<Box<dyn BitV>>,
-    ) -> Option<Box<dyn BitV>> {
-        let hp = have_pieces?;
+    ) -> anyhow::Result<Option<Box<dyn BitV>>> {
+        if self.is_pause_requested() {
+            bail!("initial check paused");
+        }
+        let Some(mut hp) = have_pieces else {
+            return Ok(None);
+        };
         let actual = hp.as_bytes().len();
-        let expected = self.metadata.lengths().piece_bitfield_bytes();
-        if actual != expected {
+        let lengths = self.metadata.lengths();
+        let expected = lengths.piece_bitfield_bytes();
+        if actual != expected || hp.as_slice().len() != expected * 8 {
             warn!(
                 actual,
                 expected,
                 "the bitfield loaded isn't of correct length, ignoring it, will do full check"
             );
-            return None;
+            self.discard_fastresume(bitv_factory, hp).await;
+            return Ok(None);
         }
+
+        let padding = &mut hp.as_slice_mut()[lengths.total_pieces() as usize..];
+        let mut changed = padding.any();
+        padding.fill(false);
+        let strict = self.shared.options.demand_only_streaming;
+        self.checked_bytes.store(0, Ordering::Relaxed);
 
         let is_broken = self
             .shared
             .spawner
-            .block_in_place_with_semaphore(|| {
-                let fo = crate::file_ops::FileOps::new(
-                    &self.metadata.info,
-                    &self.files,
-                    &self.metadata.file_infos,
-                );
-
-                let mut to_validate = BF::from_boxed_slice(
-                    vec![0u8; self.metadata.lengths().piece_bitfield_bytes()].into_boxed_slice(),
-                );
-                let mut queue = hp.as_slice().to_owned();
-
-                // Validate at least one piece from each file, if we claim we have it.
-                for fi in self.metadata.file_infos.iter() {
-                    let prange = fi.piece_range_usize();
-                    let offset = prange.start;
-                    for piece_id in hp
-                        .as_slice()
-                        .get(fi.piece_range_usize())
-                        .into_iter()
-                        .flat_map(|s| s.iter_ones())
-                        .map(|pid| pid + offset)
-                        .take(1)
-                    {
-                        to_validate.set(piece_id, true);
-                        queue.set(piece_id, false);
-                    }
+            .block_in_place_with_semaphore(|| -> anyhow::Result<bool> {
+                if self.is_pause_requested() {
+                    bail!("initial check paused");
                 }
+                let fo = FileOps::new(&self.metadata.info, &self.files, &self.metadata.file_infos);
 
-                // For all the remaining pieces we claim we have, validate them with decreasing probability.
-                let queue = queue
-                    .iter_ones()
-                    .sample(&mut rand::rng(), MAX_FASTRESUME_CHECKS);
+                let mut to_validate = if strict {
+                    // Persisted claims are hints, not proof. Hash every claimed
+                    // piece, but avoid reading unclaimed holes in a sparse cache.
+                    hp.as_slice().to_owned()
+                } else {
+                    let mut selected = BF::from_boxed_slice(vec![0u8; expected].into());
+                    let mut queue = hp.as_slice().to_owned();
 
-                for (tmp_id, piece_id) in queue.into_iter().enumerate() {
-                    let denom: u32 = (tmp_id + 1).min(50).try_into().unwrap();
-                    if rand::rng().random_ratio(1, denom) {
-                        to_validate.set(piece_id, true);
+                    // Preserve the legacy sampling policy outside streaming opt-in.
+                    for fi in self.metadata.file_infos.iter() {
+                        let offset = fi.piece_range_usize().start;
+                        for piece_id in hp
+                            .as_slice()
+                            .get(fi.piece_range_usize())
+                            .into_iter()
+                            .flat_map(|s| s.iter_ones())
+                            .map(|pid| pid + offset)
+                            .take(1)
+                        {
+                            selected.set(piece_id, true);
+                            queue.set(piece_id, false);
+                        }
                     }
-                }
-
+                    let queue = queue
+                        .iter_ones()
+                        .sample(&mut rand::rng(), MAX_FASTRESUME_CHECKS);
+                    for (tmp_id, piece_id) in queue.into_iter().enumerate() {
+                        let denom: u32 = (tmp_id + 1).min(50).try_into().unwrap();
+                        if rand::rng().random_ratio(1, denom) {
+                            selected.set(piece_id, true);
+                        }
+                    }
+                    selected.into_bitvec()
+                };
+                // Keep iteration bounded even for a custom BitV implementation.
+                to_validate.truncate(lengths.total_pieces() as usize);
                 let to_validate_count = to_validate.count_ones();
-                for (id, piece_id) in to_validate
-                    .iter_ones()
-                    .filter_map(|id| {
-                        self.metadata
-                            .lengths()
-                            .validate_piece_index(id.try_into().ok()?)
-                    })
-                    .enumerate()
-                {
-                    if fo.check_piece(piece_id).is_err() {
-                        return true;
+                let mut invalid_pieces = 0usize;
+                let mut checked_bytes = 0u64;
+                for (id, piece_id) in to_validate.iter_ones().enumerate() {
+                    if self.is_pause_requested() {
+                        bail!("initial check paused");
                     }
-
-                    #[allow(clippy::cast_possible_truncation)]
-                    let progress = (self.metadata.lengths().total_length() as f64
-                        / to_validate_count as f64
-                        * (id + 1) as f64) as u64;
-                    let progress = progress.min(self.metadata.lengths().total_length());
+                    let piece = lengths
+                        .validate_piece_index(piece_id.try_into()?)
+                        .context("invalid fastresume piece index")?;
+                    // A checksum mismatch is Ok(false), not an I/O error.
+                    let valid = fo.check_piece_with_cancel(piece, &self.pause_requested);
+                    if self.is_pause_requested() {
+                        bail!("initial check paused");
+                    }
+                    if !matches!(valid, Ok(true)) {
+                        if !strict {
+                            return Ok(true);
+                        }
+                        hp.as_slice_mut().set(piece_id, false);
+                        changed = true;
+                        invalid_pieces += 1;
+                    }
+                    checked_bytes += u64::from(lengths.piece_length(piece));
+                    let progress = if strict {
+                        checked_bytes
+                    } else {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let progress = (lengths.total_length() as f64 / to_validate_count as f64
+                            * (id + 1) as f64) as u64;
+                        progress.min(lengths.total_length())
+                    };
                     self.checked_bytes.store(progress, Ordering::Relaxed);
                 }
-
-                false
+                if self.is_pause_requested() {
+                    bail!("initial check paused");
+                }
+                info!(
+                    torrent = ?self.shared.id,
+                    strict,
+                    checked_pieces = to_validate_count,
+                    invalid_pieces,
+                    checked_bytes,
+                    "validated persisted piece claims"
+                );
+                Ok(false)
             })
-            .await;
+            .await?;
 
         if is_broken {
             warn!(
@@ -176,14 +230,18 @@ impl TorrentStateInitializing {
                 info_hash = ?self.shared.info_hash,
                 "data corrupted, ignoring fastresume data"
             );
-            if let Err(e) = bitv_factory.clear(self.shared.id.into()).await {
-                warn!(id=?self.shared.id, info_hash = ?self.shared.info_hash, "error clearing bitfield: {e:#}");
-            }
-            self.checked_bytes.store(0, Ordering::Relaxed);
-            return None;
+            self.discard_fastresume(bitv_factory, hp).await;
+            return Ok(None);
         }
 
-        Some(hp)
+        if changed {
+            // Keep this same value and its flusher alive in the chunk tracker.
+            // Replacing it could let an old Drop snapshot restore invalid claims.
+            if let Err(e) = hp.flush(false) {
+                warn!(torrent = ?self.shared.id, "error flushing corrected resume bitfield: {e:#}");
+            }
+        }
+        Ok(Some(hp))
     }
 
     pub async fn check(&self) -> anyhow::Result<TorrentStatePaused> {
@@ -207,7 +265,9 @@ impl TorrentStateInitializing {
                 .context("error loading have_pieces")?
         };
 
-        let have_pieces = self.validate_fastresume(&*bitv_factory, have_pieces).await;
+        let have_pieces = self
+            .validate_fastresume(&*bitv_factory, have_pieces)
+            .await?;
 
         let have_pieces = match have_pieces {
             Some(h) => h,
@@ -297,7 +357,9 @@ impl TorrentStateInitializing {
             metadata: self.metadata.clone(),
             files: self.files.take()?,
             chunk_tracker,
-            streams: Arc::new(Default::default()),
+            streams: Arc::new(super::streaming::TorrentStreams::new(
+                self.shared.options.demand_only_streaming,
+            )),
         };
         Ok(paused)
     }

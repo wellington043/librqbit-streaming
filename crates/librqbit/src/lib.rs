@@ -1,3 +1,5 @@
+// Modified for WebTorrent Desktop streaming phase 3.
+
 //!
 //! This crate provides everything necessary to download [torrents](https://en.wikipedia.org/wiki/BitTorrent).
 //!
@@ -97,8 +99,12 @@ pub use session::{
 };
 pub use stream_connect::ConnectionOptions;
 pub use torrent_state::{
-    ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,
-    TorrentStatsState,
+    FileStream, ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, PeerAvailabilityError,
+    PeerAvailabilityView, PeerCounters, PeerRegionAvailability, PeerRequestFlowSnapshot,
+    PeerRequestLimitError, PeerStats, PeerStatsFilter, PeerStatsFilterState, PeerStatsSnapshot,
+    PlaybackHint, RecoveryAttempt, RecoverySnapshot, StreamPriority, StreamingControlError,
+    StreamingPolicySnapshot, StreamingReadOptions, StreamingReaderSnapshot, TorrentMetadata,
+    TorrentStats, TorrentStatsState, VerifiedSample,
 };
 pub use type_aliases::FileInfos;
 
@@ -117,8 +123,11 @@ pub const fn version() -> &'static str {
 }
 
 pub const fn client_name_and_version() -> &'static str {
-    concat!("rqbit ", env!("CARGO_PKG_VERSION"))
+    concat!("librqbit-streaming ", env!("CARGO_PKG_VERSION"))
 }
+
+/// Local source revision. The protocol and upstream package version remain 9.1.0.
+pub const LOCAL_REVISION: &str = "librqbit-streaming.1";
 
 pub fn try_increase_nofile_limit() -> anyhow::Result<u64> {
     Ok(rlimit::increase_nofile_limit(1024 * 1024)?)

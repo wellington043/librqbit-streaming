@@ -1,3 +1,4 @@
+// Modified for the librqbit-streaming fork.
 pub mod json;
 #[cfg(feature = "postgres")]
 pub mod postgres;
@@ -30,6 +31,8 @@ pub struct SerializedTorrent {
     output_folder: PathBuf,
     only_files: Option<Vec<usize>>,
     is_paused: bool,
+    #[serde(default)]
+    demand_only_streaming: bool,
 }
 
 impl SerializedTorrent {
@@ -51,6 +54,7 @@ impl SerializedTorrent {
 
         let opts = AddTorrentOptions {
             paused: self.is_paused,
+            demand_only_streaming: self.demand_only_streaming,
             output_folder: Some(
                 self.output_folder
                     .to_str()

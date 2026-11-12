@@ -1,8 +1,12 @@
+// Modified for WebTorrent Desktop streaming phase 3.
+
 pub mod initializing;
 pub mod live;
 pub mod paused;
 pub mod stats;
 mod streaming;
+mod streaming_control;
+mod streaming_policy;
 pub mod utils;
 
 use std::collections::HashSet;
@@ -51,9 +55,16 @@ use crate::type_aliases::PeerStream;
 
 use initializing::TorrentStateInitializing;
 
+pub use self::live::peer::stats::snapshot::{
+    PeerCounters, PeerStats, PeerStatsFilter, PeerStatsFilterState, PeerStatsSnapshot,
+};
 use self::paused::TorrentStatePaused;
 pub use self::stats::{TorrentStats, TorrentStatsState};
-pub use self::streaming::FileStream;
+pub use self::streaming::{FileStream, StreamingPolicySnapshot, StreamingReaderSnapshot};
+pub use self::streaming_control::{
+    PlaybackHint, StreamPriority, StreamingControlError, StreamingReadOptions,
+};
+pub use self::streaming_policy::{RecoveryAttempt, RecoverySnapshot, VerifiedSample};
 
 // State machine transitions.
 //
@@ -113,6 +124,7 @@ pub(crate) struct ManagedTorrentOptions {
     pub peer_connect_timeout: Option<Duration>,
     pub peer_read_write_timeout: Option<Duration>,
     pub peer_max_request_window: Option<usize>,
+    pub demand_only_streaming: bool,
     pub allow_overwrite: bool,
     pub output_folder: PathBuf,
     pub ratelimits: LimitsConfig,

@@ -6,7 +6,7 @@ edition = "2024"
 description = "The main library used by rqbit torrent client. The binary is just a small wrapper on top of it."
 license = "Apache-2.0"
 documentation = "https://docs.rs/librqbit"
-repository = "https://github.com/ikatson/rqbit"
+repository = "https://github.com/wellington043/librqbit-streaming"
 readme = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -15,9 +15,9 @@ readme = "README.md"
 default = ["default-tls", "http-api-client"]
 
 tokio-console = ["console-subscriber", "tokio/tracing"]
-http-api = ["axum", "tower-http"]
-http-api-client = []
-upnp-serve-adapter = ["upnp-serve"]
+http-api = ["axum", "tower-http", "dep:axum-extra", "dep:base64", "dep:urlencoding", "librqbit-dualstack-sockets/axum", "tracing-subscriber-utils"]
+http-api-client = ["dep:serde_urlencoded"]
+upnp-serve-adapter = ["upnp-serve", "dep:urlencoding"]
 webui = []
 timed_existence = []
 default-tls = [
@@ -62,17 +62,17 @@ governor.workspace = true
 console-subscriber = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 tower-http = { workspace = true, features = ["cors", "trace"], optional = true }
-tokio-stream.workspace = true
+tokio-stream = { workspace = true, features = ["sync"] }
 serde = { workspace = true, features = ["rc"] }
 serde_derive.workspace = true
 serde_json.workspace = true
-serde_urlencoded.workspace = true
+serde_urlencoded = { workspace = true, optional = true }
 anyhow.workspace = true
 itertools.workspace = true
 http.workspace = true
 regex.workspace = true
 reqwest = { workspace = true, features = ["json", "socks", "stream"] }
-urlencoding.workspace = true
+urlencoding = { workspace = true, optional = true }
 byteorder.workspace = true
 bitvec.workspace = true
 parking_lot.workspace = true
@@ -86,7 +86,7 @@ url = { workspace = true, features = ["serde"] }
 hex.workspace = true
 backon.workspace = true
 dashmap.workspace = true
-base64.workspace = true
+base64 = { workspace = true, optional = true }
 serde_with.workspace = true
 tokio-util = { workspace = true, features = ["io"] }
 metrics-exporter-prometheus = { workspace = true, optional = true }
@@ -105,8 +105,8 @@ arc-swap.workspace = true
 intervaltree.workspace = true
 async-compression = { workspace = true, features = ["tokio", "gzip"] }
 librqbit-utp = { workspace = true, features = ["export-metrics"] }
-axum-extra = { workspace = true, features = ["query"] }
-librqbit-dualstack-sockets = { workspace = true, features = ["axum"] }
+axum-extra = { workspace = true, features = ["query"], optional = true }
+librqbit-dualstack-sockets.workspace = true
 socket2.workspace = true
 nix = { workspace = true, features = ["uio"] }
 thiserror.workspace = true

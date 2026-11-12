@@ -1,3 +1,5 @@
+// Modified for WebTorrent Desktop streaming phase 3.
+
 //! Coordinates piece download state by wrapping ChunkTracker with inflight piece tracking.
 //!
 //! This module provides the [`PieceTracker`] type which encapsulates the relationship between
@@ -120,7 +122,80 @@ impl PieceTracker {
     ///
     /// If `Stolen` is returned, the caller MUST call `peers.on_steal()` to notify
     /// the old peer and update counters.
-    pub fn acquire_piece<I, P, S>(&mut self, mut req: AcquireRequest<I, P, S>) -> AcquireResult
+    pub fn acquire_piece<I, P, S>(&mut self, req: AcquireRequest<I, P, S>) -> AcquireResult
+    where
+        I: Iterator<Item = ValidPieceIndex>,
+        P: Fn(ValidPieceIndex) -> bool,
+        S: Fn(ValidPieceIndex) -> bool,
+    {
+        self.acquire_piece_in_mode(req, false)
+    }
+
+    pub(crate) fn acquire_stream_piece<I, P, S>(
+        &mut self,
+        mut req: AcquireRequest<I, P, S>,
+    ) -> AcquireResult
+    where
+        I: Iterator<Item = ValidPieceIndex>,
+        P: Fn(ValidPieceIndex) -> bool,
+        S: Fn(ValidPieceIndex) -> bool,
+    {
+        // The iterator already carries class, deadline and reader fairness.
+        // An old lower-class reservation must not jump ahead of that ordering,
+        // including when every candidate is already in flight. A >=10x slow
+        // piece is still stealable, but only at its position in this iterator.
+        for piece in &mut req.priority_pieces {
+            if !(req.peer_has_piece)(piece)
+                || !self.stream_piece_is_acquirable(
+                    piece,
+                    req.peer,
+                    req.peer_avg_time,
+                    &req.can_steal,
+                )
+            {
+                continue;
+            }
+            if let Some(inflight) = self.inflight.get_mut(&piece) {
+                let from_peer = inflight.peer;
+                inflight.peer = req.peer;
+                inflight.started = Instant::now();
+                return AcquireResult::Stolen { piece, from_peer };
+            }
+            return self.reserve_piece(piece, req.peer);
+        }
+        AcquireResult::NoneAvailable
+    }
+
+    /// Whether a streaming peer can make new progress on this piece now.
+    /// Shared by ordered acquisition and preemption, so unavailable, protected,
+    /// already-owned or hashing pieces cannot evict useful lower-class work.
+    pub(crate) fn stream_piece_is_acquirable(
+        &self,
+        piece: ValidPieceIndex,
+        peer: PeerHandle,
+        peer_avg_time: Option<Duration>,
+        can_steal: impl Fn(ValidPieceIndex) -> bool,
+    ) -> bool {
+        if self.chunks.is_piece_have(piece) || self.chunks.piece_chunks_complete(piece) {
+            return false;
+        }
+        match self.inflight.get(&piece) {
+            None => true,
+            Some(inflight) => {
+                inflight.peer != peer
+                    && peer_avg_time.is_some_and(|average| {
+                        inflight.started.elapsed() >= average.saturating_mul(3)
+                    })
+                    && can_steal(piece)
+            }
+        }
+    }
+
+    fn acquire_piece_in_mode<I, P, S>(
+        &mut self,
+        mut req: AcquireRequest<I, P, S>,
+        demand_only: bool,
+    ) -> AcquireResult
     where
         I: Iterator<Item = ValidPieceIndex>,
         P: Fn(ValidPieceIndex) -> bool,
@@ -136,6 +211,7 @@ impl PieceTracker {
         for piece in &mut req.priority_pieces {
             if !self.chunks.is_piece_have(piece)
                 && !self.inflight.contains_key(&piece)
+                && (!demand_only || !self.chunks.piece_chunks_complete(piece))
                 && (req.peer_has_piece)(piece)
             {
                 return self.reserve_piece(piece, req.peer);
@@ -144,13 +220,12 @@ impl PieceTracker {
 
         // Then check naturally ordered queued pieces
         // Note: iter_queued_pieces only returns pieces in queue_pieces (not in-flight)
-        let queued: Vec<_> = self
-            .chunks
-            .iter_queued_pieces(req.file_priorities, req.file_infos)
-            .collect();
-
-        for piece in queued {
-            if (req.peer_has_piece)(piece) {
+        if !demand_only {
+            let queued = self
+                .chunks
+                .iter_queued_pieces(req.file_priorities, req.file_infos)
+                .find(|piece| (req.peer_has_piece)(*piece));
+            if let Some(piece) = queued {
                 return self.reserve_piece(piece, req.peer);
             }
         }
@@ -237,6 +312,23 @@ impl PieceTracker {
     /// Mark piece as failed after hash verification failure - requeues the piece.
     pub fn mark_piece_hash_failed(&mut self, piece: ValidPieceIndex) {
         self.chunks.mark_piece_broken_if_not_have(piece);
+    }
+
+    pub(crate) fn release_piece_owned_by(
+        &mut self,
+        piece: ValidPieceIndex,
+        peer: PeerHandle,
+    ) -> bool {
+        if self
+            .get_inflight(piece)
+            .is_some_and(|inflight| inflight.peer == peer)
+        {
+            self.inflight.remove(&piece);
+            self.chunks.mark_piece_broken_if_not_have(piece);
+            true
+        } else {
+            false
+        }
     }
 
     /// Release all pieces owned by a peer (on peer death).
@@ -371,6 +463,88 @@ mod tests {
 
     fn make_default_file_priorities(file_infos: &FileInfos) -> FilePriorities {
         (0..file_infos.len()).collect()
+    }
+
+    #[test]
+    fn priority_regression_ordered_stream_piece_precedes_old_low_priority_steal() {
+        for high_age_seconds in [None, Some(4), Some(40)] {
+            let mut tracker = PieceTracker::new(make_test_chunk_tracker(2));
+            let lengths = *tracker.chunks().get_lengths();
+            let low = lengths.validate_piece_index(0).unwrap();
+            let high = lengths.validate_piece_index(1).unwrap();
+            tracker.reserve_piece(low, peer(1));
+            tracker.inflight.get_mut(&low).unwrap().started =
+                Instant::now() - Duration::from_secs(100);
+            if let Some(age) = high_age_seconds {
+                tracker.reserve_piece(high, peer(2));
+                tracker.inflight.get_mut(&high).unwrap().started =
+                    Instant::now() - Duration::from_secs(age);
+            }
+            let files = make_test_file_infos(2);
+            let priorities = make_default_file_priorities(&files);
+            let result = tracker.acquire_stream_piece(AcquireRequest {
+                peer: peer(3),
+                peer_avg_time: Some(Duration::from_secs(1)),
+                priority_pieces: [high, low].into_iter(),
+                file_priorities: &priorities,
+                file_infos: &files,
+                peer_has_piece: |_| true,
+                can_steal: |_| true,
+            });
+            match (high_age_seconds, result) {
+                (None, AcquireResult::Reserved(piece)) => assert_eq!(piece, high),
+                (Some(_), AcquireResult::Stolen { piece, from_peer }) => {
+                    assert_eq!(
+                        piece, high,
+                        "ordered high class must win even when every piece is in flight"
+                    );
+                    assert_eq!(from_peer, peer(2));
+                }
+                (_, result) => panic!("unexpected acquisition: {result:?}"),
+            }
+            assert_eq!(tracker.get_inflight(low).unwrap().peer, peer(1));
+        }
+    }
+
+    #[test]
+    fn priority_regression_stream_steal_preserves_eligibility_and_hash_gates() {
+        for (high_age, high_advertised, high_unlocked, high_complete) in [
+            (1, true, true, false),
+            (40, false, true, false),
+            (40, true, false, false),
+            (40, true, true, true),
+        ] {
+            let mut tracker = PieceTracker::new(make_test_chunk_tracker(2));
+            let lengths = *tracker.chunks().get_lengths();
+            let low = lengths.validate_piece_index(0).unwrap();
+            let high = lengths.validate_piece_index(1).unwrap();
+            tracker.reserve_piece(low, peer(1));
+            tracker.reserve_piece(high, peer(2));
+            tracker.inflight.get_mut(&low).unwrap().started =
+                Instant::now() - Duration::from_secs(100);
+            tracker.inflight.get_mut(&high).unwrap().started =
+                Instant::now() - Duration::from_secs(high_age);
+            if high_complete {
+                tracker.mark_chunk_downloaded(&Piece::from_data(1, 0, &[0; 16384]));
+            }
+            let files = make_test_file_infos(2);
+            let priorities = make_default_file_priorities(&files);
+            let result = tracker.acquire_stream_piece(AcquireRequest {
+                peer: peer(3),
+                peer_avg_time: Some(Duration::from_secs(1)),
+                priority_pieces: [high, low].into_iter(),
+                file_priorities: &priorities,
+                file_infos: &files,
+                peer_has_piece: |p| p == low || high_advertised,
+                can_steal: |p| p == low || high_unlocked,
+            });
+            assert!(matches!(result, AcquireResult::Stolen { piece, .. } if piece == low));
+            assert_eq!(tracker.get_inflight(high).unwrap().peer, peer(2));
+            assert!(
+                !tracker.chunks().is_piece_have(high),
+                "complete chunks are not verified bytes"
+            );
+        }
     }
 
     #[test]

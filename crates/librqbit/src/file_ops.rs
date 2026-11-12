@@ -1,3 +1,4 @@
+// Modified for the librqbit-streaming fork.
 use std::{
     marker::PhantomData,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
@@ -184,6 +185,22 @@ impl<'a> FileOps<'a> {
     }
 
     pub fn check_piece(&self, piece_index: ValidPieceIndex) -> anyhow::Result<bool> {
+        self.check_piece_inner(piece_index, None)
+    }
+
+    pub fn check_piece_with_cancel(
+        &self,
+        piece_index: ValidPieceIndex,
+        pause_requested: &AtomicBool,
+    ) -> anyhow::Result<bool> {
+        self.check_piece_inner(piece_index, Some(pause_requested))
+    }
+
+    fn check_piece_inner(
+        &self,
+        piece_index: ValidPieceIndex,
+        pause_requested: Option<&AtomicBool>,
+    ) -> anyhow::Result<bool> {
         if cfg!(feature = "_disable_disk_write_net_benchmark") {
             return Ok(true);
         }
@@ -209,21 +226,29 @@ impl<'a> FileOps<'a> {
                 "piece={}, file_idx={}, seeking to {}",
                 piece_index, file_idx, absolute_offset,
             );
-            update_hash_from_file(
-                file_idx,
-                fi,
-                absolute_offset,
-                self.files,
-                &mut h,
-                &mut buf,
-                to_read_in_file,
-            )
-            .with_context(|| {
-                format!(
-                    "error reading {to_read_in_file} bytes, file_id: {file_idx} (\"{:?}\")",
-                    fi.relative_filename
+            let mut read_in_file = 0;
+            while read_in_file < to_read_in_file {
+                if pause_requested.is_some_and(|paused| paused.load(Ordering::Relaxed)) {
+                    bail!("initial check paused");
+                }
+                let size = (to_read_in_file - read_in_file).min(buf.len());
+                update_hash_from_file(
+                    file_idx,
+                    fi,
+                    absolute_offset + read_in_file as u64,
+                    self.files,
+                    &mut h,
+                    &mut buf,
+                    size,
                 )
-            })?;
+                .with_context(|| {
+                    format!(
+                        "error reading {to_read_in_file} bytes, file_id: {file_idx} (\"{:?}\")",
+                        fi.relative_filename
+                    )
+                })?;
+                read_in_file += size;
+            }
 
             piece_remaining_bytes -= to_read_in_file;
 

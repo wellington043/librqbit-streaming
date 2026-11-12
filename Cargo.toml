@@ -17,21 +17,9 @@ members = [
     "desktop/src-tauri",
 ]
 
-# Everything except desktop
-default-members = [
-    "crates/rqbit",
-    "crates/librqbit",
-    "crates/buffers",
-    "crates/clone_to_owned",
-    "crates/bencode",
-    "crates/sha1w",
-    "crates/librqbit_core",
-    "crates/peer_binary_protocol",
-    "crates/dht",
-    "crates/upnp",
-    "crates/tracker_comms",
-    "crates/upnp-serve",
-]
+# Streaming fork: compile the library and its required protocol dependencies.
+# CLI, HTTP server, UI and Tauri remain available through explicit selections.
+default-members = ["crates/librqbit"]
 
 [workspace.package]
 version = "9.1.0"

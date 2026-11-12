@@ -1,0 +1,44 @@
+name: Streaming library
+
+on:
+  push:
+    branches: ["codex/streaming-foundation", "streaming"]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/streaming-library.yml"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: streaming-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  library:
+    # Windows is checked locally before publication; CI adds a Linux check.
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      E2E_NUM_SERVERS: "4"
+      E2E_TIMEOUT: "180"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.100.0"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check minimal and optional HTTP APIs
+        run: cargo check --locked -p librqbit --no-default-features --features rust-tls,http-api,http-api-client --all-targets
+      - name: Lint library
+        run: cargo clippy --locked -p librqbit --no-default-features --features rust-tls --all-targets
+      - name: Library and external streaming contracts
+        run: cargo test --locked -p librqbit --no-default-features --features rust-tls -- --test-threads=1
+      - name: Build minimal release library
+        run: cargo build --locked --release -p librqbit --no-default-features --features rust-tls

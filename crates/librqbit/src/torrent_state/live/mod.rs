@@ -1,3 +1,5 @@
+// Modified for WebTorrent Desktop streaming phase 3.
+
 // The main logic of rqbit is here - connecting to peers, reading and writing messages
 // to them, tracking peer state etc.
 //
@@ -42,6 +44,14 @@
 pub mod peer;
 pub mod peers;
 pub mod stats;
+
+#[cfg(test)]
+mod priority_tests;
+
+pub use peer::request_flow::{PeerRequestFlowSnapshot, PeerRequestLimitError};
+pub use peers::availability::{
+    PeerAvailabilityError, PeerAvailabilityView, PeerRegionAvailability,
+};
 
 use std::{
     borrow::Cow,
@@ -115,6 +125,7 @@ use super::{
     ManagedTorrentShared, TorrentMetadata,
     paused::TorrentStatePaused,
     streaming::TorrentStreams,
+    streaming_policy::{AcceleratedRetry, normal_retry_deadline},
     utils::{TimedExistence, timeit},
 };
 
@@ -178,6 +189,49 @@ pub enum AddIncomingPeerResult {
     ConcurrencyLimitReached,
 }
 
+struct StreamRetry {
+    failed_at: Instant,
+    fallback_at: Instant,
+    episode: CancellationToken,
+}
+
+struct PeerQueueEntry {
+    addr: SocketAddr,
+    recovery: Option<StreamRetry>,
+}
+
+impl From<SocketAddr> for PeerQueueEntry {
+    fn from(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            recovery: None,
+        }
+    }
+}
+
+enum StreamIssue {
+    Issued,
+    Abandon,
+    Retry,
+}
+
+fn streaming_transport_failure(error: &Error) -> bool {
+    use std::io::ErrorKind;
+    match error {
+        Error::PeerDisconnected | Error::Timeout("reading" | "writing") => true,
+        Error::Read(error) | Error::Write(error) => matches!(
+            error.kind(),
+            ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::BrokenPipe
+                | ErrorKind::UnexpectedEof
+                | ErrorKind::TimedOut
+                | ErrorKind::NotConnected
+        ),
+        _ => false,
+    }
+}
+
 pub struct TorrentStateLive {
     peers: PeerStates,
     pub(crate) shared: Arc<ManagedTorrentShared>,
@@ -195,7 +249,9 @@ pub struct TorrentStateLive {
     peer_semaphore: Arc<Semaphore>,
 
     // The queue for peer manager to connect to them.
-    peer_queue_tx: UnboundedSender<SocketAddr>,
+    peer_queue_tx: UnboundedSender<PeerQueueEntry>,
+    // Serialize eligibility checks with events that make a connection useful.
+    recovery_availability: Option<Mutex<()>>,
 
     finished_notify: Notify,
     new_pieces_notify: Notify,
@@ -291,6 +347,11 @@ impl TorrentStateLive {
             )),
             new_pieces_notify: Notify::new(),
             peer_queue_tx,
+            recovery_availability: paused
+                .shared
+                .options
+                .demand_only_streaming
+                .then(Mutex::default),
             finished_notify: Notify::new(),
             down_speed_estimator,
             up_speed_estimator,
@@ -482,6 +543,8 @@ impl TorrentStateLive {
         let handler = PeerHandler {
             addr: checked_peer.addr,
             incoming: true,
+            verified_at_start: 0,
+            recovery_attempt: None,
             on_bitfield_notify: Default::default(),
             flow_control: Mutex::new(PeerFlowControl::new(self.max_request_window())),
             state: self.clone(),
@@ -533,11 +596,20 @@ impl TorrentStateLive {
 
     async fn task_manage_outgoing_peer(
         self: Arc<Self>,
-        addr: SocketAddr,
+        entry: PeerQueueEntry,
         permit: OwnedSemaphorePermit,
     ) -> crate::Result<()> {
         let state = self;
-        let (rx, tx) = state.peers.mark_peer_connecting(addr)?;
+        let addr = entry.addr;
+        let (rx, tx, recovery_attempt) = if let Some(retry) = entry.recovery {
+            let Some((rx, tx, attempt)) = state.start_stream_recovery(addr, &retry) else {
+                return Ok(());
+            };
+            (rx, tx, Some(attempt))
+        } else {
+            let (rx, tx) = state.peers.mark_peer_connecting(addr)?;
+            (rx, tx, None)
+        };
         let counters = state
             .peers
             .with_peer(addr, |p| p.stats.counters.clone())
@@ -546,6 +618,10 @@ impl TorrentStateLive {
         let handler = PeerHandler {
             addr,
             incoming: false,
+            verified_at_start: counters
+                .downloaded_and_checked_pieces
+                .load(Ordering::Acquire),
+            recovery_attempt,
             on_bitfield_notify: Default::default(),
             flow_control: Mutex::new(PeerFlowControl::new(state.max_request_window())),
             state: state.clone(),
@@ -605,16 +681,93 @@ impl TorrentStateLive {
         Ok(())
     }
 
+    fn with_stream_blocked<R>(
+        &self,
+        check: impl FnOnce(HashSet<ValidPieceIndex>, &mut super::streaming_policy::Recovery) -> R,
+    ) -> Option<R> {
+        let state = self.lock_read("stream recovery demand");
+        let chunks = state.get_chunks().ok()?;
+        self.streams
+            .with_blocked(&self.lengths, |piece| !chunks.is_piece_have(piece), check)
+    }
+
+    fn start_stream_recovery(
+        &self,
+        addr: SocketAddr,
+        retry: &StreamRetry,
+    ) -> Option<(PeerRx, PeerTx, AcceleratedRetry)> {
+        // Hold off positive availability changes until the Dead -> Connecting
+        // transition. No peer or torrent lock is held when scanning the peer map.
+        let _availability = self.recovery_availability.as_ref()?.lock();
+        let now = Instant::now();
+        if retry.episode.is_cancelled() || now >= retry.fallback_at {
+            return None;
+        }
+        let blocked = self.with_stream_blocked(|blocked, recovery| {
+            (!blocked.is_empty() && recovery.can_accelerate(now)).then_some(blocked)
+        })??;
+        let useful = self.peers.states.iter().any(|entry| {
+            entry.get_live().is_some_and(|live| {
+                live.stream_unchoked
+                    && blocked.iter().any(|piece| {
+                        live.bitfield
+                            .get(piece.get_usize())
+                            .is_some_and(|have| *have)
+                    })
+            })
+        });
+        if useful {
+            return None;
+        }
+
+        self.peers
+            .with_peer_mut(addr, "start stream recovery", |peer| {
+                if retry.episode.is_cancelled() || !matches!(peer.get_state(), PeerState::Dead) {
+                    return None;
+                }
+                // Demand and verification can change while we scan the peer map.
+                // Recheck both and hold the demand lock through the transition.
+                self.with_stream_blocked(|current, recovery| {
+                    let now = Instant::now();
+                    if current != blocked
+                        || now >= retry.fallback_at
+                        || !recovery.can_accelerate(now)
+                    {
+                        return None;
+                    }
+                    peer.set_state(PeerState::Queued, &self.peers);
+                    let (rx, tx) = peer.idle_to_connecting(&self.peers)?;
+                    Some((
+                        rx,
+                        tx,
+                        recovery.accelerate(retry.failed_at, retry.fallback_at, now),
+                    ))
+                })
+                .flatten()
+            })
+            .flatten()
+    }
+
     async fn task_peer_adder(
         self: Arc<Self>,
-        mut peer_queue_rx: UnboundedReceiver<SocketAddr>,
+        mut peer_queue_rx: UnboundedReceiver<PeerQueueEntry>,
     ) -> crate::Result<()> {
         let state = self;
         loop {
-            let addr = peer_queue_rx.recv().await.ok_or(Error::TorrentIsNotLive)?;
+            let entry = peer_queue_rx.recv().await.ok_or(Error::TorrentIsNotLive)?;
+            let addr = entry.addr;
+            if entry
+                .recovery
+                .as_ref()
+                .is_some_and(|retry| retry.episode.is_cancelled())
+            {
+                continue;
+            }
             if state.shared.options.disable_upload() && state.is_finished_and_no_active_streams() {
                 debug!(?addr, "ignoring peer as we are finished");
-                state.peers.mark_peer_not_needed(addr);
+                if entry.recovery.is_none() {
+                    state.peers.mark_peer_not_needed(addr);
+                }
                 continue;
             }
 
@@ -658,11 +811,20 @@ impl TorrentStateLive {
                 continue;
             }
 
-            let permit = state.peer_semaphore.clone().acquire_owned().await?;
+            let acquire = state.peer_semaphore.clone().acquire_owned();
+            let permit = if let Some(retry) = entry.recovery.as_ref() {
+                tokio::select! {
+                    biased;
+                    _ = retry.episode.cancelled() => continue,
+                    permit = acquire => permit?,
+                }
+            } else {
+                acquire.await?
+            };
             state.spawn(
                 debug_span!(parent: state.shared.span.clone(), "manage_peer", peer = ?addr),
                 format!("[{}][addr={addr}]manage_peer", state.shared.id),
-                aframe!(state.clone().task_manage_outgoing_peer(addr, permit)),
+                aframe!(state.clone().task_manage_outgoing_peer(entry, permit)),
             );
         }
     }
@@ -734,7 +896,7 @@ impl TorrentStateLive {
         };
 
         self.peer_queue_tx
-            .send(addr)
+            .send(addr.into())
             .ok()
             .ok_or(Error::TorrentIsNotLive)?;
         Ok(true)
@@ -763,6 +925,17 @@ impl TorrentStateLive {
                 .map(|e| (e.key().to_string(), e.value().into()))
                 .collect(),
         }
+    }
+
+    /// Inspect at most 4096 absolute torrent pieces, end exclusive. Availability
+    /// is the union advertised by connected peers, not a whole-swarm guarantee.
+    /// Unknown peers can have pieces counted as missing from the observed union.
+    pub fn peer_region_availability(
+        &self,
+        piece_range: std::ops::Range<u32>,
+    ) -> Result<PeerRegionAvailability, PeerAvailabilityError> {
+        self.peers
+            .region_availability(piece_range, self.lengths.total_pieces())
     }
 
     pub async fn wait_until_completed(&self) {
@@ -835,6 +1008,7 @@ impl TorrentStateLive {
         };
         self.streams
             .streamed_file_ids()
+            .into_iter()
             .any(|file_id| !chunks.is_file_finished(&self.metadata.file_infos[file_id]))
     }
 
@@ -914,7 +1088,7 @@ impl TorrentStateLive {
             .states
             .iter_mut()
             .filter_map(|mut p| p.value_mut().reconnect_not_needed_peer(&self.peers))
-            .map(|socket_addr| self.peer_queue_tx.send(socket_addr))
+            .map(|socket_addr| self.peer_queue_tx.send(socket_addr.into()))
             .take_while(|r| r.is_ok())
             .last();
     }
@@ -1041,6 +1215,8 @@ struct PeerHandler {
     tx: PeerTx,
 
     first_message_received: AtomicBool,
+    verified_at_start: u32,
+    recovery_attempt: Option<AcceleratedRetry>,
 
     cancel_token: CancellationToken,
 
@@ -1142,6 +1318,9 @@ impl PeerConnectionHandler for &'_ PeerHandler {
 
     fn on_handshake(&self, handshake: Handshake, ckind: ConnectionKind) -> anyhow::Result<()> {
         self.state.set_peer_live(self.addr, handshake, ckind);
+        if let Some(attempt) = self.recovery_attempt {
+            self.state.streams.record_recovery_handshake(attempt.id);
+        }
         Ok(())
     }
 
@@ -1173,17 +1352,42 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                 });
         }
 
-        if let Some(reqq) = hs.reqq.and_then(|reqq| usize::try_from(reqq).ok())
-            && reqq > 0
-        {
-            let request_window = reqq.min(self.state.max_request_window());
-            let mut flow = self.lock_flow_control("update request window");
-            if flow.request_window != request_window {
-                debug!(
-                    reqq,
-                    request_window, "updated peer request window from extended handshake"
-                );
+        let request_window = if self.state.shared.options.demand_only_streaming {
+            hs.reqq
+                .map(|reqq| {
+                    peer::request_flow::streaming_request_limit(
+                        self.state.max_request_window(),
+                        Some(reqq),
+                    )
+                })
+                .transpose()?
+        } else {
+            // Preserve the legacy interpretation of zero/missing reqq.
+            hs.reqq
+                .filter(|reqq| *reqq > 0)
+                .map(|reqq| (reqq as usize).min(self.state.max_request_window()))
+        };
+        if let Some(request_window) = request_window {
+            let changed = {
+                let mut flow = self.lock_flow_control("update request window");
+                let changed = flow.request_window != request_window;
                 flow.request_window = request_window;
+                changed
+            };
+            if self.state.shared.options.demand_only_streaming {
+                self.state.peers.with_live_mut(
+                    self.addr,
+                    "update streaming request limit",
+                    |live| {
+                        live.streaming_request_window(request_window, Instant::now());
+                    },
+                );
+            }
+            if changed {
+                debug!(
+                    request_window,
+                    "updated peer request window from extended handshake"
+                );
                 self.notify_request_slots_changed();
             }
         }
@@ -1264,6 +1468,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
 
 impl PeerHandler {
     fn on_peer_died(self, error: Option<crate::Error>) -> crate::Result<()> {
+        let failed_at = Instant::now();
         let peers = &self.state.peers;
         let handle = self.addr;
         let mut pe = match peers.states.get_mut(&handle) {
@@ -1279,6 +1484,13 @@ impl PeerHandler {
             }
         };
         let prev = pe.value_mut().take_state(peers);
+        let productive = !self.incoming
+            && matches!(&prev, PeerState::Live(_))
+            && self
+                .counters
+                .downloaded_and_checked_pieces
+                .load(Ordering::Acquire)
+                != self.verified_at_start;
 
         match prev {
             PeerState::Connecting(_) => {}
@@ -1329,7 +1541,7 @@ impl PeerHandler {
             }
         };
 
-        let _error = match error {
+        let error = match error {
             Some(e) => e,
             None => {
                 trace!("peer died without errors, not re-queueing");
@@ -1357,15 +1569,31 @@ impl PeerHandler {
             return Ok(());
         }
 
-        let backoff = pe.value_mut().stats.backoff.next();
+        let fallback_at =
+            normal_retry_deadline(self.recovery_attempt, productive, failed_at, || {
+                pe.value_mut().stats.backoff.next()
+            });
+        let episode = self
+            .state
+            .shared
+            .options
+            .demand_only_streaming
+            .then(CancellationToken::new);
+        pe.value_mut().stream_retry = episode.clone();
 
         // Prevent deadlocks.
         drop(pe);
 
-        if let Some(dur) = backoff {
+        let accelerate = episode.is_some() && productive && streaming_transport_failure(&error);
+        if accelerate {
+            self.state.streams.record_transport_failure();
+        }
+
+        if let Some(fallback_at) = fallback_at {
             if cfg!(feature = "_disable_reconnect_test") {
                 return Ok(());
             }
+            let dur = fallback_at.duration_since(failed_at);
             self.state.clone().spawn(
                 debug_span!(
                     parent: self.state.shared.span.clone(),
@@ -1375,40 +1603,65 @@ impl PeerHandler {
                 ),
                 format!("[{}][addr={}]wait_for_peer", self.state.shared.id, handle),
                 async move {
-                    trace!("waiting to reconnect again");
-                    tokio::time::sleep(dur).await;
-                    trace!("finished waiting");
+                    if let Some(episode) = episode.as_ref() {
+                        if accelerate {
+                            let fast_at =
+                                failed_at + Duration::from_millis(rand::random_range(4000..=5000));
+                            tokio::select! {
+                                biased;
+                                _ = episode.cancelled() => return Ok(()),
+                                _ = tokio::time::sleep_until(fast_at.into()) => {}
+                            }
+                            let eligible = self
+                                .state
+                                .with_stream_blocked(|blocked, recovery| {
+                                    !blocked.is_empty() && recovery.can_accelerate(Instant::now())
+                                })
+                                .unwrap_or(false);
+                            if eligible {
+                                self.state
+                                    .peer_queue_tx
+                                    .send(PeerQueueEntry {
+                                        addr: handle,
+                                        recovery: Some(StreamRetry {
+                                            failed_at,
+                                            fallback_at,
+                                            episode: episode.clone(),
+                                        }),
+                                    })
+                                    .map_err(|_| Error::TorrentIsNotLive)?;
+                            }
+                        }
+                        tokio::select! {
+                            biased;
+                            _ = episode.cancelled() => return Ok(()),
+                            _ = tokio::time::sleep_until(fallback_at.into()) => {}
+                        }
+                    } else {
+                        // Preserve the upstream wait for torrents without streaming policy.
+                        tokio::time::sleep(dur).await;
+                    }
                     let should_requeue = self
                         .state
                         .peers
                         .with_peer_mut(handle, "dead_to_queued", |peer| {
-                            match peer.get_state() {
-                                PeerState::Dead => {
-                                    peer.set_state(PeerState::Queued, &self.state.peers);
-                                    true
-                                }
-                                // Peer reconnected (e.g. via incoming connection) while we were
-                                // waiting. No need to queue - it's already connected or queued.
-                                PeerState::Live(_)
-                                | PeerState::Connecting(_)
-                                | PeerState::Queued => {
-                                    trace!(
-                                        state = peer.get_state().name(),
-                                        "peer is no longer dead, skipping requeue"
-                                    );
-                                    false
-                                }
-                                // Don't need this peer anymore.
-                                PeerState::NotNeeded => false,
+                            if matches!(peer.get_state(), PeerState::Dead)
+                                && !episode
+                                    .as_ref()
+                                    .is_some_and(|episode| episode.is_cancelled())
+                            {
+                                peer.set_state(PeerState::Queued, &self.state.peers);
+                                true
+                            } else {
+                                false
                             }
                         })
                         .unwrap_or(false);
                     if should_requeue {
                         self.state
                             .peer_queue_tx
-                            .send(handle)
-                            .ok()
-                            .ok_or(Error::TorrentIsNotLive)?;
+                            .send(handle.into())
+                            .map_err(|_| Error::TorrentIsNotLive)?;
                     }
                     Ok::<_, Error>(())
                 },
@@ -1446,19 +1699,38 @@ impl PeerHandler {
                     ..
                 } = &mut **g;
                 let pieces = pieces.as_mut().ok_or(Error::ChunkTrackerEmpty)?;
-                let result = pieces.acquire_piece(AcquireRequest {
-                    peer: self.addr,
-                    peer_avg_time: self.counters.average_piece_download_time(),
-                    priority_pieces: self.state.streams.iter_next_pieces(&self.state.lengths),
-                    file_priorities,
-                    file_infos: &self.state.metadata.file_infos,
-                    peer_has_piece: |p| bf.get(p.get() as usize).map(|v| *v) == Some(true),
-                    can_steal: |p| {
-                        self.state.per_piece_locks[p.get_usize()]
-                            .try_write()
-                            .is_some()
+                let result = self.state.streams.with_scheduling(
+                    &self.state.lengths,
+                    |demand, priority_pieces| {
+                        let request = AcquireRequest {
+                            peer: self.addr,
+                            peer_avg_time: self.counters.average_piece_download_time(),
+                            priority_pieces,
+                            file_priorities,
+                            file_infos: &self.state.metadata.file_infos,
+                            peer_has_piece: |p: ValidPieceIndex| {
+                                bf.get(p.get_usize()).is_some_and(|value| *value)
+                                    && demand.is_none_or(|demand| {
+                                        let start = u64::from(p.get())
+                                            * u64::from(self.state.lengths.default_piece_length());
+                                        let end =
+                                            start + u64::from(self.state.lengths.piece_length(p));
+                                        demand.intersects(start..end)
+                                    })
+                            },
+                            can_steal: |p: ValidPieceIndex| {
+                                self.state.per_piece_locks[p.get_usize()]
+                                    .try_write()
+                                    .is_some()
+                            },
+                        };
+                        if demand.is_some() {
+                            pieces.acquire_stream_piece(request)
+                        } else {
+                            pieces.acquire_piece(request)
+                        }
                     },
-                });
+                );
 
                 match result {
                     AcquireResult::Reserved(piece) => {
@@ -1533,6 +1805,7 @@ impl PeerHandler {
     }
 
     fn on_have(&self, have: u32) {
+        let _availability = self.state.recovery_availability.as_ref().map(Mutex::lock);
         self.state
             .peers
             .with_live_mut(self.addr, "on_have", |live| {
@@ -1566,6 +1839,7 @@ impl PeerHandler {
     }
 
     fn on_bitfield(&self, bitfield: ByteBufOwned) -> anyhow::Result<()> {
+        let _availability = self.state.recovery_availability.as_ref().map(Mutex::lock);
         if bitfield.as_ref().len() != self.state.lengths.piece_bitfield_bytes() {
             anyhow::bail!(
                 "dropping peer as its bitfield has unexpected size. Got {}, expected {}",
@@ -1610,22 +1884,103 @@ impl PeerHandler {
     }
 
     async fn wait_for_request_slot(&self) {
+        let streaming = self.state.shared.options.demand_only_streaming;
         loop {
             let Some(notify) = self.request_slots_changed() else {
                 return;
             };
             let notified = notify.notified();
+            let demand_changed = self.state.streams.demand_changed.notified();
             if self.can_send_request() {
                 return;
             }
-            notified.await;
+            if streaming {
+                self.release_obsolete_stream_requests();
+            }
+            if self.can_send_request() {
+                return;
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = demand_changed, if streaming => {}
+                // Retry a piece whose hash/write lock prevented cancellation,
+                // and age flow samples without relying on a peer response.
+                _ = tokio::time::sleep(Duration::from_millis(500)), if streaming => {}
+            }
         }
+    }
+
+    fn release_obsolete_stream_requests(&self) {
+        self.state
+            .peers
+            .with_live_mut(self.addr, "cancel obsolete stream requests", |live| {
+                let candidates: HashSet<_> = live
+                    .inflight_requests()
+                    .map(|chunk| chunk.piece_index)
+                    .collect();
+                if candidates.is_empty() {
+                    return;
+                }
+                let mut locked = self.state.lock_write("cancel obsolete stream requests");
+                let Ok(pieces) = locked.get_pieces_mut() else {
+                    return;
+                };
+                for piece in candidates {
+                    self.state.streams.with_piece_preemption(
+                        piece,
+                        &self.state.lengths,
+                        |demanded, higher| {
+                            if !self.should_preempt_stream_piece(demanded, higher, live, pieces) {
+                                return;
+                            }
+                            let Some(_piece_write) =
+                                self.state.per_piece_locks[piece.get_usize()].try_write()
+                            else {
+                                return;
+                            };
+                            if pieces.release_piece_owned_by(piece, self.addr) {
+                                live.cancel_inflight_requests_for_piece(piece);
+                                self.state.new_pieces_notify.notify_waiters();
+                            }
+                        },
+                    );
+                }
+            });
+    }
+
+    fn should_preempt_stream_piece(
+        &self,
+        demanded: bool,
+        higher: &mut dyn Iterator<Item = ValidPieceIndex>,
+        live: &peer::LivePeerState,
+        pieces: &PieceTracker,
+    ) -> bool {
+        if !demanded {
+            return true;
+        }
+        let average = self.counters.average_piece_download_time();
+        for candidate in higher {
+            if live
+                .bitfield
+                .get(candidate.get_usize())
+                .is_some_and(|bit| *bit)
+                && pieces.stream_piece_is_acquirable(candidate, self.addr, average, |p| {
+                    self.state.per_piece_locks[p.get_usize()]
+                        .try_write()
+                        .is_some()
+                })
+            {
+                return true;
+            }
+        }
+        false
     }
 
     // The job of this is to request chunks and also to keep peer alive.
     // The moment this ends, the peer is disconnected.
     async fn task_peer_chunk_requester(&self) -> crate::Result<()> {
         let handle = self.addr;
+        let demand_only = self.state.shared.options.demand_only_streaming;
         self.wait_for_bitfield().await;
 
         let mut update_interest = {
@@ -1645,7 +2000,10 @@ impl PeerHandler {
             }
         };
 
-        loop {
+        'request_pieces: loop {
+            if demand_only {
+                self.release_obsolete_stream_requests();
+            }
             // If we have full torrent, we don't need to request more pieces.
             // However we might still need to seed them to the peer.
             if self.state.is_finished_and_no_active_streams() {
@@ -1679,6 +2037,7 @@ impl PeerHandler {
 
             // Acquire a piece using the strategy: try steal (10x) → reserve → steal (3x).
             let new_piece_notify = self.state.new_pieces_notify.notified();
+            let demand_notify = self.state.streams.demand_changed.notified();
             let next = match self.acquire_next_piece()? {
                 Some(next) => next,
                 None => {
@@ -1686,7 +2045,12 @@ impl PeerHandler {
                     match aframe!(tokio::time::timeout(
                         // Half of default rw timeout not to race with it.
                         Duration::from_secs(5),
-                        new_piece_notify
+                        async {
+                            tokio::select! {
+                                _ = new_piece_notify => {}
+                                _ = demand_notify, if demand_only => {}
+                            }
+                        }
                     ))
                     .await
                     {
@@ -1719,6 +2083,18 @@ impl PeerHandler {
                 }
 
                 aframe!(self.wait_for_request_slot()).await;
+
+                if demand_only {
+                    loop {
+                        aframe!(self.wait_for_request_slot()).await;
+                        match self.issue_stream_chunk(chunk, request)? {
+                            StreamIssue::Issued => break,
+                            StreamIssue::Abandon => continue 'request_pieces,
+                            StreamIssue::Retry => tokio::task::yield_now().await,
+                        }
+                    }
+                    continue;
+                }
 
                 match self
                     .state
@@ -1758,8 +2134,58 @@ impl PeerHandler {
         }
     }
 
+    fn issue_stream_chunk(&self, chunk: ChunkInfo, request: Request) -> crate::Result<StreamIssue> {
+        self.state
+            .peers
+            .with_live_mut(self.addr, "issue stream chunk", |live| {
+                let mut locked = self.state.lock_write("issue stream chunk");
+                let pieces = locked.get_pieces_mut()?;
+                let piece = chunk.piece_index;
+                if !pieces
+                    .get_inflight(piece)
+                    .is_some_and(|inflight| inflight.peer == self.addr)
+                {
+                    return Ok(StreamIssue::Abandon);
+                }
+
+                self.state.streams.with_piece_preemption(
+                    piece,
+                    &self.state.lengths,
+                    |demanded, higher| {
+                        if self.should_preempt_stream_piece(demanded, higher, live, pieces) {
+                            let Some(_piece_write) =
+                                self.state.per_piece_locks[piece.get_usize()].try_write()
+                            else {
+                                return Ok(StreamIssue::Retry);
+                            };
+                            if pieces.release_piece_owned_by(piece, self.addr) {
+                                live.cancel_inflight_requests_for_piece(piece);
+                                self.state.new_pieces_notify.notify_waiters();
+                            }
+                            return Ok(StreamIssue::Abandon);
+                        }
+
+                        if live.add_inflight_request(chunk) {
+                            self.tx
+                                .send(WriterRequest::Message(Message::Request(request)))
+                                .map_err(|_| Error::PeerTaskDead)?;
+                        }
+                        Ok(StreamIssue::Issued)
+                    },
+                )
+            })
+            .unwrap_or(Err(Error::PeerTaskDead))
+    }
+
     fn on_i_am_choked(&self) {
         self.lock_flow_control("i_am_choked = true").i_am_choked = true;
+        if self.state.recovery_availability.is_some() {
+            self.state
+                .peers
+                .with_live_mut(self.addr, "stream choke", |live| {
+                    live.stream_unchoked = false;
+                });
+        }
         self.notify_request_slots_changed();
     }
 
@@ -1771,6 +2197,14 @@ impl PeerHandler {
     fn on_i_am_unchoked(&self) {
         trace!("we are unchoked");
         self.lock_flow_control("i_am_choked = false").i_am_choked = false;
+        if let Some(availability) = self.state.recovery_availability.as_ref() {
+            let _availability = availability.lock();
+            self.state
+                .peers
+                .with_live_mut(self.addr, "stream unchoke", |live| {
+                    live.stream_unchoked = true;
+                });
+        }
         self.notify_request_slots_changed();
     }
 
@@ -1816,6 +2250,15 @@ impl PeerHandler {
             })
             .context("peer not found")??;
 
+        if self.state.shared.options.demand_only_streaming {
+            self.state.streams.record_payload(
+                piece_index,
+                chunk_info.offset,
+                chunk_info.size,
+                should_process,
+                &self.state.lengths,
+            );
+        }
         if !should_process {
             return Ok(());
         }
@@ -1837,6 +2280,7 @@ impl PeerHandler {
             counters: &AtomicPeerCounters,
             piece: &Piece<ByteBuf<'_>>,
             chunk_info: &ChunkInfo,
+            recovery_attempt: Option<u64>,
         ) -> anyhow::Result<()> {
             let index = piece.index;
 
@@ -1967,6 +2411,14 @@ impl PeerHandler {
                     // Per-peer piece counters.
                     counters.on_piece_completed(piece_len, full_piece_download_time);
                     state.peers.reset_peer_backoff(addr);
+                    if state.shared.options.demand_only_streaming {
+                        state.streams.record_verified(
+                            chunk_info.piece_index,
+                            piece_len,
+                            &state.lengths,
+                            recovery_attempt,
+                        );
+                    }
 
                     trace!(piece = index, "successfully downloaded and verified");
 
@@ -1996,7 +2448,14 @@ impl PeerHandler {
             .shared
             .spawner
             .block_in_place_with_semaphore(|| {
-                write_to_disk(&self.state, self.addr, &self.counters, &piece, &chunk_info)
+                write_to_disk(
+                    &self.state,
+                    self.addr,
+                    &self.counters,
+                    &piece,
+                    &chunk_info,
+                    self.recovery_attempt.map(|attempt| attempt.id),
+                )
             })
             .await
             .with_context(|| format!("error processing received chunk {chunk_info:?}"))?;
@@ -2073,8 +2532,18 @@ impl PeerHandler {
             return false;
         }
 
-        self.requested_inflight_count()
-            .is_some_and(|requested| requested < request_window)
+        if self.state.shared.options.demand_only_streaming {
+            self.state
+                .peers
+                .with_live_mut(self.addr, "adaptive request window", |live| {
+                    let window = live.streaming_request_window(request_window, Instant::now());
+                    live.requested_inflight_count() < window
+                })
+                .unwrap_or(false)
+        } else {
+            self.requested_inflight_count()
+                .is_some_and(|requested| requested < request_window)
+        }
     }
 
     fn lock_flow_control(

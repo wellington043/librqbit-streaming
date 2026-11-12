@@ -1,7 +1,9 @@
+// Modified for the librqbit-streaming fork.
 use std::{collections::HashMap, sync::atomic::Ordering};
 
 use serde::{Deserialize, Serialize};
 
+use super::super::request_flow::PeerRequestFlowSnapshot;
 use crate::{
     stream_connect::ConnectionKind,
     torrent_state::live::peer::{Peer, PeerState},
@@ -29,6 +31,8 @@ pub struct PeerStats {
     pub state: &'static str,
     pub conn_kind: Option<ConnectionKind>,
     pub client_name: Option<String>,
+    /// Present only after request flow has been enabled for a streaming peer.
+    pub request_flow: Option<PeerRequestFlowSnapshot>,
 }
 
 impl From<&super::atomic::PeerCountersAtomic> for PeerCounters {
@@ -66,6 +70,10 @@ impl From<&Peer> for PeerStats {
             },
             client_name: match state {
                 PeerState::Live(l) => l.client_name.clone(),
+                _ => None,
+            },
+            request_flow: match state {
+                PeerState::Live(l) => l.request_flow_snapshot(),
                 _ => None,
             },
         }

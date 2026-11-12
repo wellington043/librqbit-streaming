@@ -1,3 +1,5 @@
+// Modified for WebTorrent Desktop streaming phase 3.
+
 use std::collections::HashSet;
 
 use anyhow::Context;
@@ -250,6 +252,10 @@ impl ChunkTracker {
 
     pub(crate) fn is_piece_have(&self, id: ValidPieceIndex) -> bool {
         self.have.as_slice()[id.get() as usize]
+    }
+
+    pub(crate) fn piece_chunks_complete(&self, id: ValidPieceIndex) -> bool {
+        self.chunk_status[self.lengths.chunk_range(id)].all()
     }
 
     pub fn mark_piece_broken_if_not_have(&mut self, index: ValidPieceIndex) {

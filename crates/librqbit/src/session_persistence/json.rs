@@ -1,3 +1,4 @@
+// Modified for the librqbit-streaming fork.
 use std::{any::TypeId, collections::HashMap, path::PathBuf};
 
 use crate::{
@@ -147,6 +148,7 @@ impl JsonSessionPersistenceStore {
             torrent_bytes: Default::default(),
             only_files: torrent.only_files().clone(),
             is_paused: torrent.is_paused(),
+            demand_only_streaming: torrent.shared().options.demand_only_streaming,
             output_folder: torrent.shared().options.output_folder.clone(),
         };
 
