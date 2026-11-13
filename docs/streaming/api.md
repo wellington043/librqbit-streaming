@@ -165,9 +165,9 @@ The callback is invoked before forwarding addresses and must be nonblocking.
 HTTP tracker response bodies are read incrementally and rejected above 2 MiB.
 
 `single_tracker_discovery` limits discovery to the first ordered tracker even
-before magnet privacy is known. Private metainfo also uses only its first
-original tracker and never adds custom or global trackers; sequential tier
-fallback is not implemented. DHT and local discovery remain separate session
+before magnet privacy is known. This explicit mode retains its single-tracker
+behavior. Ordinary private torrents use the sequential policy below and never
+add custom or global trackers. DHT and local discovery remain separate session
 options. Magnet metadata resolution honors the peer limit and bounds its seen
 address set. `metadata_size_limit` rejects larger announced peer metadata before
 allocation; the default remains 32 MiB and the hard maximum is 32 MiB.
@@ -190,4 +190,44 @@ For failover, first drop the attempt's caller-owned add/metadata/media futures, 
 
 A catalog caller should hold one overall deadline and one shared `PayloadBudget` across attempts. Advance only on an observed tracker failure; a valid response with zero peers or unusable peers is not permission to switch a private tracker. Exhausting failed candidates is an explicit tracker error, not evidence of zero availability.
 
-This API is for bounded one-shot catalog analysis. It does not add long-lived desktop multitracker monitoring or change the default tracker's periodic retry policy. No live-network performance or private-tracker interoperability claim is implied by loopback tests. Protocol references: [BEP 12](https://www.bittorrent.org/beps/bep_0012.html) and [BEP 27](https://www.bittorrent.org/beps/bep_0027.html).
+This API remains a bounded one-shot catalog operation, independent from the continuous policy below. No live-network performance or private-tracker interoperability claim is implied by loopback tests. Protocol references: [BEP 12](https://www.bittorrent.org/beps/bep_0012.html) and [BEP 27](https://www.bittorrent.org/beps/bep_0027.html).
+
+
+## Continuous tracker discovery
+
+Ordinary sessions announce sequentially through the original tiers using HTTP,
+HTTPS or UDP. URLs are deduplicated, members are shuffled within each tier once,
+and successful trackers are promoted within their tier. Public torrents start
+at the first tier on each subsequent announce. Known private torrents keep the
+successful tracker until it fails; before switching, peer admission closes and
+old connections and retry tasks are cancelled and drained. Queued old peers and
+seen-peer history cannot enter the next generation. Incoming handshakes accepted
+before the switch are rejected even if they finish after a pause/resume; the
+initial generation still allows handshakes that awaited initialization. Newly
+accepted inbound connections retain normal behavior; this is not authentication
+of a remote peer's tracker membership. Known private torrents exclude
+custom/global trackers, DHT, local discovery, initial peers and PEX.
+
+Each announce, including DNS and body reading, has a 30-second deadline. Only a
+failed announce advances immediately: success with zero peers still waits for
+the tracker interval. The greater of interval/min-interval is respected, with a
+five-second floor; `force_tracker_interval` may lengthen but cannot shorten it.
+After a complete failed pass, retry delays increase from 10 to at most 600
+seconds. Cancellation drops the current request or wait without recording a
+false tracker failure. HTTP responses remain bounded to 2 MiB and diagnostics
+omit credentials, paths, queries and tracker-supplied error text.
+
+Magnet privacy is unknown before metadata. The normal DHT/local-discovery
+bootstrap policy remains enabled where configured; this is not a promise that
+unknown magnets are private. A public result retains its discovery stream and
+announce interval. A private result drops unknown-privacy discovery and all
+metadata peer history before starting the private policy. Explicit
+`single_tracker_discovery` and one-shot `tracker_attempt` retain their separate
+contracts above. The low-level `TrackerComms::start` API is unchanged;
+`start_tiered` is the sequential interface and requires an awaited drain callback
+for private callers.
+
+Focused tests use synthetic data and loopback sockets for tiers, empty success,
+backoff, cancellation and private peer teardown. They do not establish swarm
+availability, public-network speedup or compatibility with a live private
+tracker. No release binary is implied by these source changes.

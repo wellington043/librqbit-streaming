@@ -3,7 +3,8 @@
 The streaming fork changes, tests, build configuration and documentation were
 developed with OpenAI Codex at the repository owner's request. This includes the
 initial imported streaming policy patch and the subsequent public API, resume,
-flow-control and diagnostics work.
+flow-control and diagnostics work, routing checkpoints, continuous tracker
+failover and foreground scheduling.
 
 Automated tests and independent agent review are recorded in the validation
 documentation. They do not constitute human code review or proof of performance

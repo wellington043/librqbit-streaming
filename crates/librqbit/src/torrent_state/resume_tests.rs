@@ -148,6 +148,8 @@ impl Fixture {
             spawner,
             trackers: Default::default(),
             ordered_trackers: Default::default(),
+            tracker_tiers: Default::default(),
+            private_tracker_cutoff: Default::default(),
             peer_id: librqbit_core::Id20::new([0; 20]),
             span: tracing::Span::none(),
             options: ManagedTorrentOptions {

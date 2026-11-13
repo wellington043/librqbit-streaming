@@ -201,6 +201,8 @@ pub struct ManagedTorrentShared {
     pub(crate) spawner: BlockingSpawner,
     pub trackers: HashSet<url::Url>,
     pub(crate) ordered_trackers: Vec<url::Url>,
+    pub(crate) tracker_tiers: Vec<Vec<url::Url>>,
+    pub(crate) private_tracker_cutoff: RwLock<Option<std::time::Instant>>,
     pub peer_id: Id20,
     pub span: tracing::Span,
     pub(crate) options: ManagedTorrentOptions,

@@ -26,6 +26,10 @@ use crate::tracker_comms_udp;
 use crate::tracker_comms_udp::UdpTrackerClient;
 use librqbit_core::hash_id::Id20;
 
+#[path = "continuous.rs"]
+mod continuous;
+pub use continuous::TrackerSwitch;
+
 /// One bounded tracker announce outcome; endpoint never contains credentials, path or query.
 #[derive(Clone, Debug)]
 pub struct TrackerObservation {
@@ -517,7 +521,7 @@ impl TrackerComms {
             .0;
 
         Ok((
-            Duration::from_secs(response.min_interval.unwrap_or(response.interval)),
+            Duration::from_secs(response.interval.max(response.min_interval.unwrap_or(0))),
             response.iter_peers().collect(),
         ))
     }
@@ -631,6 +635,15 @@ impl TrackerComms {
         addr: SocketAddr,
         client: &UdpTrackerClient,
     ) -> anyhow::Result<(Duration, Vec<SocketAddr>)> {
+        self.fetch_udp_event(addr, client, None).await
+    }
+
+    async fn fetch_udp_event(
+        &self,
+        addr: SocketAddr,
+        client: &UdpTrackerClient,
+        event: Option<u32>,
+    ) -> anyhow::Result<(Duration, Vec<SocketAddr>)> {
         use tracker_comms_udp::*;
 
         let stats = self.stats.get();
@@ -640,7 +653,7 @@ impl TrackerComms {
             downloaded: stats.downloaded_bytes,
             left: stats.get_left_to_download_bytes(),
             uploaded: stats.uploaded_bytes,
-            event: match stats.torrent_state {
+            event: event.unwrap_or_else(|| match stats.torrent_state {
                 TrackerCommsStatsState::None => EVENT_NONE,
                 TrackerCommsStatsState::Initializing => EVENT_STARTED,
                 TrackerCommsStatsState::Paused => EVENT_STOPPED,
@@ -651,7 +664,7 @@ impl TrackerComms {
                         EVENT_STARTED
                     }
                 }
-            },
+            }),
             key: self.key,
             port: self.announce_port,
         };

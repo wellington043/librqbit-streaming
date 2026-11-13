@@ -489,6 +489,28 @@ impl RoutingTable {
     pub fn id(&self) -> Id20 {
         self.id
     }
+
+    /// Rebuild untrusted persisted data without traversing its stored tree links,
+    /// counters, bounds or bucket capacity. All structure is newly constructed.
+    pub(crate) fn rebuild_persisted(&self, ipv6: bool) -> Self {
+        let mut rebuilt = Self::new(self.id, None);
+        let mut examined = 0usize;
+        for bucket in &self.buckets.data {
+            if let BucketTreeNodeData::Leaf(leaf) = &bucket.data {
+                for node in &leaf.nodes {
+                    if examined >= 4096 || rebuilt.len() >= Self::DEFAULT_MAX_SIZE {
+                        return rebuilt;
+                    }
+                    examined += 1;
+                    if node.id != self.id && node.addr.is_ipv6() == ipv6 {
+                        rebuilt.add_node(node.id, node.addr);
+                    }
+                }
+            }
+        }
+        rebuilt
+    }
+
     pub fn len(&self) -> usize {
         self.size
     }

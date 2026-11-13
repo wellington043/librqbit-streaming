@@ -625,6 +625,7 @@ fn torrent_file_from_info_bytes(info_bytes: &[u8], trackers: &[url::Url]) -> any
 }
 
 pub(crate) struct CheckedIncomingConnection {
+    pub accepted_at: std::time::Instant,
     pub kind: ConnectionKind,
     pub addr: SocketAddr,
     pub reader: BoxAsyncReadVectored,
@@ -637,6 +638,7 @@ struct InternalAddResult {
     info_hash: Id20,
     metadata: Option<TorrentMetadata>,
     trackers: Vec<url::Url>,
+    tracker_tiers: Vec<Vec<url::Url>>,
     name: Option<String>,
 }
 
@@ -1006,6 +1008,7 @@ impl Session {
     async fn check_incoming_connection(
         self: Arc<Self>,
         addr: SocketAddr,
+        accepted_at: std::time::Instant,
         kind: ConnectionKind,
         mut reader: BoxAsyncReadVectored,
         writer: BoxAsyncWrite,
@@ -1059,6 +1062,7 @@ impl Session {
         Ok((
             live,
             CheckedIncomingConnection {
+                accepted_at,
                 addr,
                 reader,
                 writer,
@@ -1079,15 +1083,23 @@ impl Session {
         drop(self);
 
         loop {
+            let accept = l.accept();
+            tokio::pin!(accept);
+            // Stamp the poll which accepts the socket, before it can be delayed
+            // between accept completion and the selected branch's execution.
+            let timed_accept = futures::future::poll_fn(|cx| {
+                let accepted_at = std::time::Instant::now();
+                std::future::Future::poll(accept.as_mut(), cx).map(|result| (accepted_at, result))
+            });
             tokio::select! {
-                r = l.accept(), if futs.len() < max_pending_incoming_handshake_checks => {
+                (accepted_at, r) = timed_accept, if futs.len() < max_pending_incoming_handshake_checks => {
                     match r {
                         Ok((addr, (read, write))) => {
                             trace!("accepted connection from {addr}");
                             let session = session.upgrade().context("session is dead")?;
                             let span = debug_span!(parent: session.rs(), "incoming", addr=%addr);
                             futs.push(
-                                session.check_incoming_connection(addr, A::KIND, Box::new(read), Box::new(write))
+                                session.check_incoming_connection(addr, accepted_at, A::KIND, Box::new(read), Box::new(write))
                                     .map_err(|e| {
                                         debug!("error checking incoming connection: {e:#}");
                                         e
@@ -1228,13 +1240,15 @@ impl Session {
                         }
                     }
 
+                    let trackers: Vec<url::Url> = magnet
+                        .trackers
+                        .into_iter()
+                        .filter_map(|t| url::Url::parse(&t).ok())
+                        .collect();
                     InternalAddResult {
                         info_hash,
-                        trackers: magnet
-                            .trackers
-                            .into_iter()
-                            .filter_map(|t| url::Url::parse(&t).ok())
-                            .collect(),
+                        tracker_tiers: trackers.iter().cloned().map(|t| vec![t]).collect(),
+                        trackers,
                         metadata: None,
                         name: magnet.name,
                     }
@@ -1257,23 +1271,41 @@ impl Session {
                         }
                     };
 
-                    let mut trackers = torrent
-                        .meta
-                        .iter_announce()
-                        .unique()
-                        .filter_map(|tracker| match std::str::from_utf8(tracker.as_ref()) {
-                            Ok(url) => Some(url.to_owned()),
-                            Err(_) => {
-                                warn!("cannot parse tracker url as utf-8, ignoring");
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>();
+                    let parse_url = |bytes: &[u8]| {
+                        std::str::from_utf8(bytes)
+                            .ok()
+                            .and_then(|value| url::Url::parse(value).ok())
+                    };
+                    let mut tracker_tiers: Vec<Vec<url::Url>> =
+                        if torrent.meta.announce_list.iter().flatten().next().is_some() {
+                            torrent
+                                .meta
+                                .announce_list
+                                .iter()
+                                .map(|tier| {
+                                    tier.iter().filter_map(|t| parse_url(t.as_ref())).collect()
+                                })
+                                .collect()
+                        } else {
+                            vec![
+                                torrent
+                                    .meta
+                                    .iter_announce()
+                                    .filter_map(|t| parse_url(t.as_ref()))
+                                    .collect(),
+                            ]
+                        };
                     if !torrent.meta.info.data.private
-                        && let Some(custom_trackers) = opts.trackers.clone()
+                        && let Some(custom) = &opts.trackers
                     {
-                        trackers.extend(custom_trackers);
+                        tracker_tiers.push(
+                            custom
+                                .iter()
+                                .filter_map(|t| url::Url::parse(t).ok())
+                                .collect(),
+                        );
                     }
+                    let trackers = tracker_tiers.iter().flatten().cloned().unique().collect();
 
                     InternalAddResult {
                         info_hash: torrent.meta.info_hash,
@@ -1282,10 +1314,8 @@ impl Session {
                             torrent.torrent_bytes,
                             torrent.meta.info.raw_bytes.0,
                         )?),
-                        trackers: trackers
-                            .iter()
-                            .filter_map(|t| url::Url::parse(t).ok())
-                            .collect(),
+                        trackers,
+                        tracker_tiers,
                         name: None,
                     }
                 }
@@ -1349,6 +1379,7 @@ impl Session {
             info_hash,
             metadata,
             trackers,
+            tracker_tiers,
             name,
         } = add_res;
 
@@ -1362,6 +1393,7 @@ impl Session {
                 opts.force_tracker_interval,
                 opts.initial_peers.clone().unwrap_or_default(),
                 private,
+                Some(tracker_tiers.clone()),
             )
         };
 
@@ -1405,6 +1437,7 @@ impl Session {
                                 opts.force_tracker_interval,
                                 Vec::new(),
                                 true,
+                                Some(tracker_tiers.clone()),
                             )
                         }
                     } else {
@@ -1491,6 +1524,8 @@ impl Session {
                 span,
                 info_hash,
                 ordered_trackers: trackers.clone(),
+                tracker_tiers,
+                private_tracker_cutoff: RwLock::new(None),
                 trackers: trackers.into_iter().collect(),
                 spawner: self.spawner.clone(),
                 peer_id: self.peer_id,
@@ -1674,10 +1709,12 @@ impl Session {
             t.shared().options.force_tracker_interval,
             t.shared().options.initial_peers.clone(),
             is_private,
+            Some(t.shared().tracker_tiers.clone()),
         )
     }
 
     // Get a peer stream from both DHT and trackers.
+    #[allow(clippy::too_many_arguments)]
     fn make_peer_rx(
         self: &Arc<Self>,
         info_hash: Id20,
@@ -1686,6 +1723,7 @@ impl Session {
         force_tracker_interval: Option<Duration>,
         initial_peers: Vec<SocketAddr>,
         is_private: bool,
+        mut tracker_tiers: Option<Vec<Vec<url::Url>>>,
     ) -> Option<PeerStream> {
         let restricted =
             is_private || self.single_tracker_discovery || self.tracker_attempt.is_some();
@@ -1707,10 +1745,14 @@ impl Session {
 
         if self.disable_trackers {
             trackers.clear();
+            tracker_tiers = None;
         }
 
         if !restricted && !self.disable_trackers {
             trackers.extend(self.trackers.iter().cloned());
+            if let Some(tiers) = &mut tracker_tiers {
+                tiers.push(self.trackers.iter().cloned().collect());
+            }
         }
         if let Some(attempt) = self.tracker_attempt.as_ref() {
             // Membership is checked against the complete original source list,
@@ -1737,17 +1779,49 @@ impl Session {
             info_hash,
             session: self.clone(),
         };
-        let tracker_rx = TrackerComms::start_with_observer(
-            info_hash,
-            self.peer_id,
-            trackers.into_iter().collect(),
-            Box::new(tracker_rx_stats),
-            force_tracker_interval,
-            self.announce_port().unwrap_or(4240),
-            self.reqwest_client.clone(),
-            self.udp_tracker_client.clone(),
-            self.tracker_observer.clone(),
-        );
+        let tracker_rx =
+            if let Some(tiers) = tracker_tiers.filter(|_| !self.single_tracker_discovery) {
+                let before_switch: Option<tracker_comms::TrackerSwitch> = is_private.then(|| {
+                    let session = Arc::downgrade(self);
+                    Arc::new(move || {
+                        let session = session.clone();
+                        async move {
+                            let live = session
+                                .upgrade()
+                                .and_then(|s| s.get(info_hash.into()))
+                                .and_then(|t| t.live());
+                            if let Some(live) = live {
+                                live.switch_private_tracker().await;
+                            }
+                        }
+                        .boxed()
+                    }) as tracker_comms::TrackerSwitch
+                });
+                TrackerComms::start_tiered(
+                    info_hash,
+                    self.peer_id,
+                    tiers,
+                    Box::new(tracker_rx_stats),
+                    force_tracker_interval,
+                    self.announce_port().unwrap_or(4240),
+                    self.reqwest_client.clone(),
+                    self.udp_tracker_client.clone(),
+                    self.tracker_observer.clone(),
+                    before_switch,
+                )
+            } else {
+                TrackerComms::start_with_observer(
+                    info_hash,
+                    self.peer_id,
+                    trackers.into_iter().collect(),
+                    Box::new(tracker_rx_stats),
+                    force_tracker_interval,
+                    self.announce_port().unwrap_or(4240),
+                    self.reqwest_client.clone(),
+                    self.udp_tracker_client.clone(),
+                    self.tracker_observer.clone(),
+                )
+            };
 
         let initial_peers_rx = if restricted || initial_peers.is_empty() {
             None
@@ -2133,6 +2207,7 @@ mod catalog_discovery_fencing_tests {
             None,
             vec!["127.0.0.1:12345".parse().unwrap()],
             true,
+            None,
         );
         assert!(
             stream.is_none(),
@@ -2144,3 +2219,6 @@ mod catalog_discovery_fencing_tests {
 
 #[cfg(test)]
 mod catalog_fencing_tests;
+
+#[cfg(test)]
+mod continuous_discovery_tests;

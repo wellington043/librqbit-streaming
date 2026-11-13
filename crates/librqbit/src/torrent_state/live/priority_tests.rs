@@ -31,6 +31,18 @@ impl Drop for Harness {
 
 impl Harness {
     async fn new(advertised: &[u32]) -> anyhow::Result<Self> {
+        Self::new_with_arbiter(advertised, None).await
+    }
+
+    async fn new_with_arbiter(
+        advertised: &[u32],
+        arbiter: Option<crate::download_arbiter::DownloadArbiter>,
+    ) -> anyhow::Result<Self> {
+        let class = if arbiter.is_some() {
+            crate::download_arbiter::DownloadClass::Background
+        } else {
+            crate::download_arbiter::DownloadClass::Foreground
+        };
         let source = tempfile::tempdir()?;
         let cache = tempfile::tempdir()?;
         let payload: Vec<_> = (0..2 * PIECE_LEN as usize)
@@ -53,6 +65,7 @@ impl Harness {
                 dht: None,
                 disable_trackers: true,
                 disable_local_service_discovery: true,
+                download_arbiter: arbiter,
                 ..Default::default()
             },
         )
@@ -62,6 +75,7 @@ impl Harness {
                 AddTorrent::from_bytes(created.as_bytes()?),
                 Some(AddTorrentOptions {
                     demand_only_streaming: true,
+                    download_class: class,
                     peer_opts: Some(PeerConnectionOptions {
                         max_request_window: Some(2),
                         ..Default::default()
@@ -95,7 +109,9 @@ impl Harness {
             bitfield.set(*piece as usize, true);
         }
         state.peers.update_bitfield(addr, bitfield, 2).unwrap();
+        let generation = state.peer_generation.lock().clone();
         let handler = Arc::new(PeerHandler {
+            generation,
             download_permits: Mutex::new(HashMap::new()),
             addr,
             incoming: true,
@@ -199,6 +215,32 @@ impl Harness {
         }
         self.session.stop().await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scheduler_stops_new_background_requests_until_foreground_recovers() -> anyhow::Result<()> {
+    let arbiter = crate::download_arbiter::DownloadArbiter::default();
+    arbiter.set_foreground(true, true);
+    let mut h = Harness::new_with_arbiter(&[0], Some(arbiter.clone())).await?;
+    let reader = h.reader(0, StreamPriority::Prefetch).await?;
+    arbiter.set_foreground(true, true);
+    h.run();
+    let first = h.request().await?;
+    let _already_sent = h.request().await?;
+    arbiter.set_foreground(true, false);
+    h.respond(first).await?;
+    assert!(
+        timeout(Duration::from_millis(120), h.request())
+            .await
+            .is_err(),
+        "no new background request after foreground becomes unhealthy"
+    );
+    arbiter.set_foreground(true, true);
+    let next = h.request().await?;
+    assert_eq!(next.index, 0);
+    drop(reader);
+    h.stop().await;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

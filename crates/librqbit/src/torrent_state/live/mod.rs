@@ -187,6 +187,7 @@ pub enum AddIncomingPeerResult {
     Added,
     AlreadyActive,
     ConcurrencyLimitReached,
+    ObsoleteTrackerGeneration,
 }
 
 struct StreamRetry {
@@ -195,18 +196,23 @@ struct StreamRetry {
     episode: CancellationToken,
 }
 
+struct PeerGeneration {
+    token: CancellationToken,
+    tasks: crate::spawn_utils::TaskGroup,
+}
+impl PeerGeneration {
+    fn new(parent: &CancellationToken) -> Arc<Self> {
+        Arc::new(Self {
+            token: parent.child_token(),
+            tasks: Default::default(),
+        })
+    }
+}
+
 struct PeerQueueEntry {
     addr: SocketAddr,
     recovery: Option<StreamRetry>,
-}
-
-impl From<SocketAddr> for PeerQueueEntry {
-    fn from(addr: SocketAddr) -> Self {
-        Self {
-            addr,
-            recovery: None,
-        }
-    }
+    generation: Arc<PeerGeneration>,
 }
 
 enum StreamIssue {
@@ -250,6 +256,7 @@ pub struct TorrentStateLive {
 
     // The queue for peer manager to connect to them.
     peer_queue_tx: UnboundedSender<PeerQueueEntry>,
+    peer_generation: Mutex<Arc<PeerGeneration>>,
     // Serialize eligibility checks with events that make a connection useful.
     recovery_availability: Option<Mutex<()>>,
 
@@ -364,6 +371,7 @@ impl TorrentStateLive {
             down_speed_estimator,
             up_speed_estimator,
             tasks: session.tasks.clone(),
+            peer_generation: Mutex::new(PeerGeneration::new(&cancellation_token)),
             cancellation_token,
             have_broadcast_tx,
             session_stats,
@@ -434,6 +442,31 @@ impl TorrentStateLive {
         }
     }
 
+    /// Fence old private peers (including queued/retry work) before announcing
+    /// another tracker. The external discovery task is deliberately not in this
+    /// group, so it can await the drain without waiting for itself.
+    pub(crate) async fn switch_private_tracker(&self) {
+        let previous = {
+            let generation = self.peer_generation.lock();
+            generation.tasks.close();
+            generation.token.cancel();
+            generation.clone()
+        };
+        previous.tasks.wait().await;
+        let mut generation = self.peer_generation.lock();
+        if !Arc::ptr_eq(&generation, &previous) {
+            return;
+        }
+        let addresses: Vec<_> = self.peers.states.iter().map(|p| *p.key()).collect();
+        for addr in addresses {
+            self.peers.drop_peer(addr);
+        }
+        self.peers.live_outgoing_peers.write().clear();
+        // Shared across pause/resume; only the initial torrent generation has no cutoff.
+        *self.shared.private_tracker_cutoff.write() = Some(Instant::now());
+        *generation = PeerGeneration::new(&self.cancellation_token);
+    }
+
     pub fn down_speed_estimator(&self) -> &SpeedEstimator {
         &self.down_speed_estimator
     }
@@ -447,6 +480,16 @@ impl TorrentStateLive {
         checked_peer: CheckedIncomingConnection,
     ) -> anyhow::Result<AddIncomingPeerResult> {
         use dashmap::mapref::entry::Entry;
+        let generation = self.peer_generation.lock();
+        if self.metadata.info.info().private
+            && (*self.shared.private_tracker_cutoff.read())
+                .is_some_and(|cutoff| checked_peer.accepted_at < cutoff)
+        {
+            return Ok(AddIncomingPeerResult::ObsoleteTrackerGeneration);
+        }
+        if generation.token.is_cancelled() {
+            return Ok(AddIncomingPeerResult::ConcurrencyLimitReached);
+        }
         let (tx, rx) = unbounded_channel();
         let permit = match self.peer_semaphore.clone().try_acquire_owned() {
             Ok(permit) => permit,
@@ -497,21 +540,22 @@ impl TorrentStateLive {
         };
         atomic_inc(&counters.incoming_connections);
 
-        self.spawn(
-            debug_span!(
-                parent: self.shared.span.clone(),
-                "manage_incoming_peer",
-                addr = %checked_peer.addr
-            ),
-            format!(
-                "[{}][addr={}]manage_incoming_peer",
-                self.shared.id, checked_peer.addr
-            ),
-            aframe!(
-                self.clone()
-                    .task_manage_incoming_peer(checked_peer, counters, tx, rx, permit)
-            ),
+        let task = self.clone().task_manage_incoming_peer(
+            checked_peer,
+            counters,
+            tx,
+            rx,
+            permit,
+            generation.clone(),
         );
+        if let Some(task) = generation.tasks.track(task) {
+            self.spawn(
+                debug_span!(parent: self.shared.span.clone(), "manage_incoming_peer"),
+                format!("[{}]manage_incoming_peer", self.shared.id),
+                task,
+            );
+        }
+
         Ok(AddIncomingPeerResult::Added)
     }
 
@@ -553,6 +597,7 @@ impl TorrentStateLive {
         tx: PeerTx,
         rx: PeerRx,
         permit: OwnedSemaphorePermit,
+        generation: Arc<PeerGeneration>,
     ) -> crate::Result<()> {
         let handler = PeerHandler {
             addr: checked_peer.addr,
@@ -566,7 +611,8 @@ impl TorrentStateLive {
             tx,
             counters,
             first_message_received: AtomicBool::new(false),
-            cancel_token: self.cancellation_token.child_token(),
+            cancel_token: generation.token.child_token(),
+            generation,
             client_name_and_version: self.shared.client_name_and_version().to_owned(),
         };
         let _token_guard = handler.cancel_token.clone().drop_guard();
@@ -587,6 +633,8 @@ impl TorrentStateLive {
         let requester = handler.task_peer_chunk_requester();
 
         let res = tokio::select! {
+            biased;
+            _ = handler.generation.token.cancelled() => Ok(()),
             r = requester => {r}
             r = peer_connection.manage_peer_incoming(
                 rx,
@@ -644,7 +692,8 @@ impl TorrentStateLive {
             tx,
             counters,
             first_message_received: AtomicBool::new(false),
-            cancel_token: state.cancellation_token.child_token(),
+            cancel_token: entry.generation.token.child_token(),
+            generation: entry.generation,
             client_name_and_version: state.shared.client_name_and_version().to_owned(),
         };
         let _token_guard = handler.cancel_token.clone().drop_guard();
@@ -679,6 +728,8 @@ impl TorrentStateLive {
             .outgoing_connection_attempts
             .fetch_add(1, Ordering::Relaxed);
         let res = tokio::select! {
+            biased;
+            _ = handler.generation.token.cancelled() => Ok(()),
             r = requester => {r}
             r = conn_manager => {r}
         };
@@ -781,7 +832,11 @@ impl TorrentStateLive {
             }
             if state.shared.options.disable_upload() && state.is_finished_and_no_active_streams() {
                 debug!(?addr, "ignoring peer as we are finished");
-                if entry.recovery.is_none() {
+                let generation = state.peer_generation.lock();
+                if Arc::ptr_eq(&generation, &entry.generation)
+                    && !generation.token.is_cancelled()
+                    && entry.recovery.is_none()
+                {
                     state.peers.mark_peer_not_needed(addr);
                 }
                 continue;
@@ -837,11 +892,18 @@ impl TorrentStateLive {
             } else {
                 acquire.await?
             };
-            state.spawn(
-                debug_span!(parent: state.shared.span.clone(), "manage_peer", peer = ?addr),
-                format!("[{}][addr={addr}]manage_peer", state.shared.id),
-                aframe!(state.clone().task_manage_outgoing_peer(entry, permit)),
-            );
+            let generation = state.peer_generation.lock();
+            if !Arc::ptr_eq(&generation, &entry.generation) || generation.token.is_cancelled() {
+                continue;
+            }
+            let task = state.clone().task_manage_outgoing_peer(entry, permit);
+            if let Some(task) = generation.tasks.track(task) {
+                state.spawn(
+                    debug_span!(parent: state.shared.span.clone(), "manage_peer", peer = ?addr),
+                    format!("[{}][addr={addr}]manage_peer", state.shared.id),
+                    task,
+                );
+            }
         }
     }
 
@@ -915,13 +977,21 @@ impl TorrentStateLive {
     }
 
     pub(crate) fn add_peer_if_not_seen(&self, addr: SocketAddr) -> crate::Result<bool> {
+        let generation = self.peer_generation.lock();
+        if generation.token.is_cancelled() {
+            return Ok(false);
+        }
         match self.peers.add_if_not_seen(addr) {
             Some(handle) => handle,
             None => return Ok(false),
         };
 
         self.peer_queue_tx
-            .send(addr.into())
+            .send(PeerQueueEntry {
+                addr,
+                recovery: None,
+                generation: generation.clone(),
+            })
             .ok()
             .ok_or(Error::TorrentIsNotLive)?;
         Ok(true)
@@ -1117,11 +1187,21 @@ impl TorrentStateLive {
     }
 
     pub(crate) fn reconnect_all_not_needed_peers(&self) {
+        let generation = self.peer_generation.lock();
+        if generation.token.is_cancelled() {
+            return;
+        }
         self.peers
             .states
             .iter_mut()
             .filter_map(|mut p| p.value_mut().reconnect_not_needed_peer(&self.peers))
-            .map(|socket_addr| self.peer_queue_tx.send(socket_addr.into()))
+            .map(|addr| {
+                self.peer_queue_tx.send(PeerQueueEntry {
+                    addr,
+                    recovery: None,
+                    generation: generation.clone(),
+                })
+            })
             .take_while(|r| r.is_ok())
             .last();
     }
@@ -1255,6 +1335,7 @@ struct PeerHandler {
     cancel_token: CancellationToken,
 
     client_name_and_version: String,
+    generation: Arc<PeerGeneration>,
 }
 
 impl PeerConnectionHandler for &'_ PeerHandler {
@@ -1636,15 +1717,15 @@ impl PeerHandler {
                 return Ok(());
             }
             let dur = fallback_at.duration_since(failed_at);
-            self.state.clone().spawn(
-                debug_span!(
-                    parent: self.state.shared.span.clone(),
-                    "wait_for_peer",
-                    peer = ?handle,
-                    duration = format!("{dur:?}")
-                ),
-                format!("[{}][addr={}]wait_for_peer", self.state.shared.id, handle),
-                async move {
+            let state_for_retry = self.state.clone();
+            let generation = self.generation.clone();
+            let retry_generation = generation.clone();
+            let task = async move {
+                tokio::select! {
+                    biased;
+                    _ = retry_generation.token.cancelled() => Ok(()),
+                    result = async move {
+
                     if let Some(episode) = episode.as_ref() {
                         if accelerate {
                             let fast_at =
@@ -1665,6 +1746,7 @@ impl PeerHandler {
                                     .peer_queue_tx
                                     .send(PeerQueueEntry {
                                         addr: handle,
+                                        generation: self.generation.clone(),
                                         recovery: Some(StreamRetry {
                                             failed_at,
                                             fallback_at,
@@ -1702,12 +1784,16 @@ impl PeerHandler {
                     if should_requeue {
                         self.state
                             .peer_queue_tx
-                            .send(handle.into())
+                            .send(PeerQueueEntry { addr: handle, recovery: None, generation: self.generation.clone() })
                             .map_err(|_| Error::TorrentIsNotLive)?;
                     }
                     Ok::<_, Error>(())
-                },
-            );
+                    } => result,
+                }
+            };
+            if let Some(task) = generation.tasks.track(task) {
+                state_for_retry.spawn(tracing::Span::none(), "wait_for_peer", task);
+            }
         } else {
             debug!("dropping peer, backoff exhausted");
             self.state.peers.drop_peer(handle);
@@ -2171,9 +2257,6 @@ impl PeerHandler {
 
                 aframe!(self.wait_for_request_slot()).await;
 
-                if let Some(arbiter) = &arbiter {
-                    arbiter.wait_allowed(self.state.download_class()).await;
-                }
                 if let Some(permit) = permit {
                     let mut permits = self.download_permits.lock();
                     match permits.entry((request.index, request.begin)) {
@@ -2196,63 +2279,93 @@ impl PeerHandler {
                 if demand_only {
                     loop {
                         aframe!(self.wait_for_request_slot()).await;
-                        match self.issue_stream_chunk(chunk, request)? {
-                            StreamIssue::Issued => break,
-                            StreamIssue::Abandon => {
-                                self.download_permits
-                                    .lock()
-                                    .remove(&(request.index, request.begin));
-                                continue 'request_pieces;
+                        let result = if let Some(arbiter) = &arbiter {
+                            arbiter.with_request_allowed(self.state.download_class(), || {
+                                self.issue_stream_chunk(chunk, request)
+                            })
+                        } else {
+                            Some(self.issue_stream_chunk(chunk, request))
+                        };
+                        match result {
+                            Some(result) => match result? {
+                                StreamIssue::Issued => break,
+                                StreamIssue::Abandon => {
+                                    self.download_permits
+                                        .lock()
+                                        .remove(&(request.index, request.begin));
+                                    continue 'request_pieces;
+                                }
+                                StreamIssue::Retry => tokio::task::yield_now().await,
+                            },
+                            None => {
+                                // A preparation can become the foreground while waiting.
+                                // Recheck its class as well as health on every bounded wait.
+                                let arbiter =
+                                    arbiter.as_ref().expect("blocked request requires arbiter");
+                                tokio::select! {
+                                    _ = self.cancel_token.cancelled() => return Ok(()),
+                                    _ = tokio::time::sleep(Duration::from_millis(250)) => {},
+                                    _ = arbiter.wait_allowed(self.state.download_class()) => {},
+                                }
                             }
-                            StreamIssue::Retry => tokio::task::yield_now().await,
                         }
                     }
                     continue;
                 }
 
-                match self
-                    .state
-                    .peers
-                    .with_live_mut(handle, "add chunk request", |live| {
-                        live.add_inflight_request(chunk)
-                    }) {
-                    Some(true) => {}
-                    Some(false) => {
-                        self.download_permits
-                            .lock()
-                            .remove(&(request.index, request.begin));
-                        // This request was already in-flight for this peer for this chunk.
-                        // This might happen in theory, but not very likely.
-                        //
-                        // Example:
-                        // someone stole a piece from us, and then died, the piece became "needed" again, and we reserved it
-                        // all before the piece request was processed by us.
-                        warn!(
-                            id = self.state.shared.id,
-                            info_hash = ?self.state.shared.info_hash,
-                            addr = ?self.addr,
-                            "we already requested {:?} previously",
-                            chunk
-                        );
-                        continue;
+                loop {
+                    aframe!(self.wait_for_request_slot()).await;
+                    let issue = || {
+                        let added =
+                            self.state
+                                .peers
+                                .with_live_mut(handle, "add chunk request", |live| {
+                                    live.add_inflight_request(chunk)
+                                });
+                        if added == Some(true) {
+                            if let Some(permit) = self
+                                .download_permits
+                                .lock()
+                                .get_mut(&(request.index, request.begin))
+                            {
+                                permit.mark_issued();
+                            }
+                            if self
+                                .tx
+                                .send(WriterRequest::Message(Message::Request(request)))
+                                .is_err()
+                            {
+                                return None;
+                            }
+                        }
+                        added
+                    };
+                    let result = if let Some(arbiter) = &arbiter {
+                        arbiter.with_request_allowed(self.state.download_class(), issue)
+                    } else {
+                        Some(issue())
+                    };
+                    match result {
+                        None => {
+                            let arbiter =
+                                arbiter.as_ref().expect("blocked request requires arbiter");
+                            tokio::select! {
+                                _ = self.cancel_token.cancelled() => return Ok(()),
+                                _ = tokio::time::sleep(Duration::from_millis(250)) => {},
+                                _ = arbiter.wait_allowed(self.state.download_class()) => {},
+                            }
+                        }
+                        Some(None) => return Ok(()),
+                        Some(Some(false)) => {
+                            self.download_permits
+                                .lock()
+                                .remove(&(request.index, request.begin));
+                            warn!(id = self.state.shared.id, info_hash = ?self.state.shared.info_hash, addr = ?self.addr,
+                                "we already requested {:?} previously", chunk);
+                            break;
+                        }
+                        Some(Some(true)) => break,
                     }
-                    // peer died
-                    None => return Ok(()),
-                };
-
-                if let Some(permit) = self
-                    .download_permits
-                    .lock()
-                    .get_mut(&(request.index, request.begin))
-                {
-                    permit.mark_issued();
-                }
-                if self
-                    .tx
-                    .send(WriterRequest::Message(Message::Request(request)))
-                    .is_err()
-                {
-                    return Ok(());
                 }
             }
         }
