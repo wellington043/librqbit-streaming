@@ -292,6 +292,32 @@ impl ChunkTracker {
         }
     }
 
+    /// Invalidation is only safe while the torrent is quiescent and readers are pinned.
+    pub(crate) fn invalidate_verified_piece(
+        &mut self,
+        idx: ValidPieceIndex,
+        files: &[FileInfo],
+    ) -> bool {
+        let id = idx.get() as usize;
+        if !self.have.as_slice()[id] {
+            return false;
+        }
+        self.have.as_slice_mut().set(id, false);
+        self.chunk_status[self.lengths.chunk_range(idx)].fill(false);
+        self.queue_pieces.set(id, self.selected[id]);
+        let bytes = self.lengths.piece_length(idx) as u64;
+        self.hns.have_bytes -= bytes;
+        if self.selected[id] {
+            self.hns.needed_bytes += bytes;
+        }
+        for (file_id, file) in files.iter().enumerate() {
+            self.per_file_bytes[file_id] -=
+                self.lengths
+                    .size_of_piece_in_file(idx.get(), file.offset_in_torrent, file.len);
+        }
+        true
+    }
+
     pub fn is_chunk_ready_to_upload(&self, chunk: &ChunkInfo) -> bool {
         self.have
             .as_slice()
@@ -424,6 +450,40 @@ mod tests {
     };
 
     use super::{ChunkTracker, compute_chunk_have_status};
+
+    #[test]
+    fn reclaim_verified_boundary_piece_updates_all_counters_and_is_idempotent() {
+        let l = Lengths::new(3 * CHUNK_SIZE as u64, CHUNK_SIZE * 2).unwrap();
+        let files = vec![
+            FileInfo {
+                relative_filename: "a".into(),
+                offset_in_torrent: 0,
+                piece_range: 0..1,
+                len: CHUNK_SIZE as u64,
+                attrs: Default::default(),
+            },
+            FileInfo {
+                relative_filename: "b".into(),
+                offset_in_torrent: CHUNK_SIZE as u64,
+                piece_range: 0..2,
+                len: 2 * CHUNK_SIZE as u64,
+                attrs: Default::default(),
+            },
+        ];
+        let mut have = BF::from_boxed_slice(vec![0u8; l.piece_bitfield_bytes()].into_boxed_slice());
+        have.get_mut(0..2).unwrap().fill(true);
+        let mut ct = ChunkTracker::new(have.clone().into_dyn(), have, l, &files).unwrap();
+        let p = l.validate_piece_index(0).unwrap();
+        assert!(ct.invalidate_verified_piece(p, &files));
+        assert!(!ct.invalidate_verified_piece(p, &files));
+        assert!(!ct.is_piece_have(p));
+        assert!(!ct.piece_chunks_complete(p));
+        assert!(ct.queue_pieces[0]);
+        assert_eq!(ct.get_hns().have_bytes, CHUNK_SIZE as u64);
+        assert_eq!(ct.get_hns().needed_bytes, 2 * CHUNK_SIZE as u64);
+        assert_eq!(ct.per_file_have_bytes(), &[0, CHUNK_SIZE as u64]);
+        assert_eq!(*ct.get_hns(), ct.calc_hns());
+    }
 
     #[test]
     fn test_compute_chunk_status() {

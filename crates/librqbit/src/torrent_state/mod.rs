@@ -3,9 +3,11 @@
 pub mod initializing;
 pub mod live;
 pub mod paused;
+mod reclaim;
 pub mod stats;
 mod streaming;
 mod streaming_control;
+pub use reclaim::{CacheReclaimError, CacheReclaimReport};
 mod streaming_policy;
 pub mod utils;
 
@@ -125,9 +127,11 @@ pub(crate) struct ManagedTorrentOptions {
     pub peer_read_write_timeout: Option<Duration>,
     pub peer_max_request_window: Option<usize>,
     pub demand_only_streaming: bool,
+    pub verify_selected_pieces: bool,
     pub allow_overwrite: bool,
     pub output_folder: PathBuf,
     pub ratelimits: LimitsConfig,
+    pub download_class: crate::download_arbiter::DownloadClass,
     pub initial_peers: Vec<SocketAddr>,
     pub peer_limit: Option<usize>,
     #[cfg(feature = "disable-upload")]

@@ -50,6 +50,7 @@ mod bitv_factory;
 mod chunk_tracker;
 mod create_torrent_file;
 mod dht_utils;
+pub mod download_arbiter;
 mod error;
 pub mod file_info;
 mod file_ops;
@@ -99,12 +100,13 @@ pub use session::{
 };
 pub use stream_connect::ConnectionOptions;
 pub use torrent_state::{
-    FileStream, ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, PeerAvailabilityError,
-    PeerAvailabilityView, PeerCounters, PeerRegionAvailability, PeerRequestFlowSnapshot,
-    PeerRequestLimitError, PeerStats, PeerStatsFilter, PeerStatsFilterState, PeerStatsSnapshot,
-    PlaybackHint, RecoveryAttempt, RecoverySnapshot, StreamPriority, StreamingControlError,
-    StreamingPolicySnapshot, StreamingReadOptions, StreamingReaderSnapshot, TorrentMetadata,
-    TorrentStats, TorrentStatsState, VerifiedSample,
+    CacheReclaimError, CacheReclaimReport, FileStream, ManagedTorrent, ManagedTorrentShared,
+    ManagedTorrentState, PeerAvailabilityError, PeerAvailabilityView, PeerCounters,
+    PeerRegionAvailability, PeerRequestFlowSnapshot, PeerRequestLimitError, PeerStats,
+    PeerStatsFilter, PeerStatsFilterState, PeerStatsSnapshot, PlaybackHint, RecoveryAttempt,
+    RecoverySnapshot, StreamPriority, StreamingControlError, StreamingPolicySnapshot,
+    StreamingReadOptions, StreamingReaderSnapshot, TorrentMetadata, TorrentStats,
+    TorrentStatsState, VerifiedSample,
 };
 pub use type_aliases::FileInfos;
 
@@ -127,7 +129,7 @@ pub const fn client_name_and_version() -> &'static str {
 }
 
 /// Local source revision. The protocol and upstream package version remain 9.1.0.
-pub const LOCAL_REVISION: &str = "librqbit-streaming.1";
+pub const LOCAL_REVISION: &str = "librqbit-streaming.2";
 
 pub fn try_increase_nofile_limit() -> anyhow::Result<u64> {
     Ok(rlimit::increase_nofile_limit(1024 * 1024)?)

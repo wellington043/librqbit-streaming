@@ -19,6 +19,11 @@ different upload limits, verified bytes, seek generations and a peer stopping.
 
 ## Local results, 2026-11-12
 
+These results describe `librqbit-streaming.1`. The `streaming.2` scheduling,
+reclamation and import APIs have focused development regressions; their complete
+release validation is tracked by the desktop integration before candidate
+delivery. The historical counts below must not be read as validation of new code.
+
 Windows x86_64 MSVC, Rust 1.100.0. Focused checks preceded one consolidated
 library test run; no desktop or former-core suite was run.
 

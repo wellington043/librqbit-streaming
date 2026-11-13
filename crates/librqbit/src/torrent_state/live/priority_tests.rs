@@ -96,6 +96,7 @@ impl Harness {
         }
         state.peers.update_bitfield(addr, bitfield, 2).unwrap();
         let handler = Arc::new(PeerHandler {
+            download_permits: Mutex::new(HashMap::new()),
             addr,
             incoming: true,
             verified_at_start: 0,

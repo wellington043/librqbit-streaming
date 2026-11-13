@@ -139,6 +139,7 @@ pub struct Session {
     // Limits and throttling
     pub(crate) concurrent_initialize_semaphore: Arc<tokio::sync::Semaphore>,
     pub ratelimits: Limits,
+    pub download_arbiter: Option<crate::download_arbiter::DownloadArbiter>,
 
     pub blocklist: IpRanges,
     pub allowlist: Option<IpRanges>,
@@ -281,6 +282,10 @@ pub struct AddTorrentOptions {
     /// recovery after a productive outgoing connection loses its transport.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub demand_only_streaming: bool,
+    /// Independently hash every selected piece on initialization, ignoring resume claims.
+    /// Suitable for owned compact selected-file storage and imported downloads.
+    #[serde(default)]
+    pub verify_selected_pieces: bool,
 
     /// Force a refresh interval for polling trackers.
     pub force_tracker_interval: Option<Duration>,
@@ -290,6 +295,9 @@ pub struct AddTorrentOptions {
 
     #[serde(default)]
     pub ratelimits: LimitsConfig,
+
+    #[serde(default)]
+    pub download_class: crate::download_arbiter::DownloadClass,
 
     /// Initial peers to start of with.
     pub initial_peers: Option<Vec<SocketAddr>>,
@@ -430,6 +438,7 @@ impl Default for DhtSessionConfig {
 }
 
 pub struct SessionOptions {
+    pub download_arbiter: Option<crate::download_arbiter::DownloadArbiter>,
     /// DHT configuration. Set to None to disable DHT entirely.
     /// Defaults to DHT enabled with persistence.
     pub dht: Option<DhtSessionConfig>,
@@ -498,6 +507,7 @@ pub struct SessionOptions {
 impl Default for SessionOptions {
     fn default() -> Self {
         Self {
+            download_arbiter: None,
             dht: Some(DhtSessionConfig::default()),
             bind_device_name: None,
             disable_trackers: false,
@@ -815,6 +825,7 @@ impl Session {
                 )),
                 udp_tracker_client,
                 ratelimits: Limits::new(opts.ratelimits),
+                download_arbiter: opts.download_arbiter,
                 ipv4_only: opts.ipv4_only,
                 trackers: opts.trackers,
                 disable_trackers: opts.disable_trackers,
@@ -1372,9 +1383,11 @@ impl Session {
                     peer_read_write_timeout: peer_opts.read_write_timeout,
                     peer_max_request_window: peer_opts.max_request_window,
                     demand_only_streaming: opts.demand_only_streaming,
+                    verify_selected_pieces: opts.verify_selected_pieces,
                     allow_overwrite: opts.overwrite,
                     output_folder,
                     ratelimits: opts.ratelimits,
+                    download_class: opts.download_class,
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
                     #[cfg(feature = "disable-upload")]

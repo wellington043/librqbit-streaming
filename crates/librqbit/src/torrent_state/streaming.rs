@@ -159,6 +159,30 @@ pub(crate) struct TorrentStreams {
 }
 
 impl TorrentStreams {
+    pub(crate) fn has_playback_reader(&self) -> bool {
+        self.state.lock().streams.values().any(|stream| {
+            stream.control.priority == StreamPriority::Playback
+                && stream.position < stream.end_exclusive
+        })
+    }
+    pub(crate) fn with_retained_pieces<R>(
+        &self,
+        lengths: &Lengths,
+        behind: u64,
+        f: impl FnOnce(&HashSet<u32>) -> R,
+    ) -> R {
+        let state = self.state.lock();
+        let retained = state
+            .streams
+            .values()
+            .flat_map(|stream| {
+                let window = stream.window(state.reader_lookahead(stream));
+                let start = window.start.saturating_sub(behind);
+                lengths.iter_pieces_within_offset(start, window.end.saturating_sub(start))
+            })
+            .collect();
+        f(&retained)
+    }
     pub(crate) fn new(demand_only: bool) -> Self {
         Self {
             next_stream_id: AtomicUsize::new(0),
@@ -580,18 +604,18 @@ impl AsyncRead for FileStream {
         let buf = &mut buf[..bytes_to_read];
 
         let start = Instant::now();
-        poll_try_io!(poll_try_io!(self.torrent.shared.spawner.block_in_place(
-            || {
-                self.torrent.with_storage_and_file(
-                    self.file_id,
-                    |files, _fi| {
-                        files.pread_exact(self.file_id, self.position, buf)?;
-                        Ok::<_, anyhow::Error>(())
-                    },
-                    &self.metadata,
-                )
-            }
-        )));
+        let read = poll_try_io!(self.torrent.shared.spawner.block_in_place(|| {
+            Ok::<_, anyhow::Error>(self.torrent.read_verified(
+                self.file_id,
+                current.id,
+                self.position,
+                buf,
+            )?)
+        }));
+        if !read {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
 
         trace!(
             buflen = buf.len(),
@@ -658,15 +682,46 @@ impl ManagedTorrent {
     {
         self.with_state(|s| {
             let files = match s {
-                crate::ManagedTorrentState::Paused(p) => &*p.files,
-                crate::ManagedTorrentState::Live(l) => &*l.files,
+                super::ManagedTorrentState::Paused(p) => &*p.files,
+                super::ManagedTorrentState::Live(l) => &*l.files,
                 s => anyhow::bail!("with_storage_and_file: invalid state: {}", s.name()),
             };
-            let fi = metadata.file_infos.get(file_id).context("invalid file")?;
-            Ok(f(files, fi))
+            Ok(f(
+                files,
+                metadata.file_infos.get(file_id).context("invalid file")?,
+            ))
         })
     }
-
+    /// Atomically recheck verified coverage and read under the reclamation barrier.
+    fn read_verified(
+        &self,
+        file_id: usize,
+        piece: ValidPieceIndex,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> anyhow::Result<bool> {
+        let g = self.locked.read();
+        match &g.state {
+            super::ManagedTorrentState::Paused(p) => {
+                if !p.chunk_tracker.is_piece_have(piece) {
+                    return Ok(false);
+                }
+                p.files.pread_exact(file_id, offset, buf)?;
+            }
+            super::ManagedTorrentState::Live(l) => {
+                if !l
+                    .lock_read("verified_read")
+                    .get_chunks()?
+                    .is_piece_have(piece)
+                {
+                    return Ok(false);
+                }
+                l.files.pread_exact(file_id, offset, buf)?;
+            }
+            _ => anyhow::bail!("torrent storage unavailable"),
+        }
+        Ok(true)
+    }
     fn streams(&self) -> anyhow::Result<Arc<TorrentStreams>> {
         self.with_state(|s| match s {
             crate::ManagedTorrentState::Paused(p) => Ok(p.streams.clone()),

@@ -96,6 +96,12 @@ fn sleep_from_reader(r: &Mutex<Box<dyn Iterator<Item = u64> + Send + Sync>>) {
 }
 
 impl<U: TorrentStorage> TorrentStorage for SlowStorage<U> {
+    fn reserve_piece(&self, piece: u32, length: u64) -> anyhow::Result<bool> {
+        self.underlying.reserve_piece(piece, length)
+    }
+    fn discard_range(&self, file_id: usize, offset: u64, length: u64) -> anyhow::Result<()> {
+        self.underlying.discard_range(file_id, offset, length)
+    }
     fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
         sleep_from_reader(&self.pread_exact_bufread);
         self.underlying.pread_exact(file_id, offset, buf)

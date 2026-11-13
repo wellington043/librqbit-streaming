@@ -58,6 +58,18 @@ impl FilesystemStorage {
 }
 
 impl TorrentStorage for FilesystemStorage {
+    fn discard_range(&self, file_id: usize, offset: u64, length: u64) -> anyhow::Result<()> {
+        let file = self
+            .opened_files
+            .get(file_id)
+            .context("no such file")?
+            .lock_read()?;
+        let existing = file.metadata()?.len();
+        if offset >= existing {
+            return Ok(());
+        }
+        super::sparse::discard_range(&file, offset, length.min(existing - offset))
+    }
     fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
         self.opened_files
             .get(file_id)

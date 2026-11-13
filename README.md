@@ -14,6 +14,9 @@ This is an experimental fork. The first milestone focuses on library APIs, corre
 - Region availability across observed peers, plus request-flow diagnostics.
 - Guarded accelerated reconnection for formerly productive peers.
 - Opt-in resume with hash verification of all claimed pieces for streaming torrents.
+- Shared payload-request arbitration across foreground, preparation and background sessions.
+- Paused, checkpoint-first piece reclamation with reader retention and sparse storage support.
+- Independent selected-piece verification for importing existing partial downloads.
 
 Normal downloads and seeding remain supported. Existing `stream` and `stream_range` callers retain their interfaces. Set `AddTorrentOptions::demand_only_streaming` to opt into the streaming scheduler. Fast resume is a separate session option and remains disabled by default.
 

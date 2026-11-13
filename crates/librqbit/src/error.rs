@@ -4,6 +4,8 @@ use tokio::sync::AcquireError;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    #[error("storage reservation failed: {0:#}")]
+    StorageReservation(anyhow::Error),
     #[error("error connecting through proxy: {0:#}")]
     SocksConnect(
         #[from]

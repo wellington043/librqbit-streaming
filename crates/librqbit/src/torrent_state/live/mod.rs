@@ -55,7 +55,7 @@ pub use peers::availability::{
 
 use std::{
     borrow::Cow,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     num::NonZeroU32,
     sync::{
@@ -273,6 +273,13 @@ pub struct TorrentStateLive {
 }
 
 impl TorrentStateLive {
+    fn download_class(&self) -> crate::download_arbiter::DownloadClass {
+        if self.shared.options.demand_only_streaming && self.streams.has_playback_reader() {
+            crate::download_arbiter::DownloadClass::Foreground
+        } else {
+            self.shared.options.download_class
+        }
+    }
     fn max_request_window(&self) -> usize {
         self.shared
             .options
@@ -544,6 +551,7 @@ impl TorrentStateLive {
             addr: checked_peer.addr,
             incoming: true,
             verified_at_start: 0,
+            download_permits: Mutex::new(HashMap::new()),
             recovery_attempt: None,
             on_bitfield_notify: Default::default(),
             flow_control: Mutex::new(PeerFlowControl::new(self.max_request_window())),
@@ -618,6 +626,7 @@ impl TorrentStateLive {
         let handler = PeerHandler {
             addr,
             incoming: false,
+            download_permits: Mutex::new(HashMap::new()),
             verified_at_start: counters
                 .downloaded_and_checked_pieces
                 .load(Ordering::Acquire),
@@ -1197,6 +1206,7 @@ impl PeerFlowControl {
 // All peer state that would never be used by other actors should pe put here.
 // This state tracks a live peer.
 struct PeerHandler {
+    download_permits: Mutex<HashMap<(u32, u32), crate::download_arbiter::DownloadPermit>>,
     state: Arc<TorrentStateLive>,
     counters: Arc<AtomicPeerCounters>,
     // Semantically, we don't need a lock here, as this is only requested from
@@ -1940,6 +1950,9 @@ impl PeerHandler {
                             };
                             if pieces.release_piece_owned_by(piece, self.addr) {
                                 live.cancel_inflight_requests_for_piece(piece);
+                                self.download_permits
+                                    .lock()
+                                    .retain(|(index, _), _| *index != piece.get());
                                 self.state.new_pieces_notify.notify_waiters();
                             }
                         },
@@ -2062,6 +2075,17 @@ impl PeerHandler {
             };
 
             for chunk in self.state.lengths.iter_chunk_infos(next) {
+                while !self
+                    .state
+                    .files
+                    .reserve_piece(next.get(), self.state.lengths.piece_length(next) as u64)
+                    .map_err(Error::StorageReservation)?
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if self.cancel_token.is_cancelled() {
+                        return Ok(());
+                    }
+                }
                 let request = Request {
                     index: next.get(),
                     begin: chunk.offset,
@@ -2070,6 +2094,26 @@ impl PeerHandler {
 
                 aframe!(self.wait_for_request_slot()).await;
 
+                let arbiter = self
+                    .state
+                    .shared
+                    .session
+                    .upgrade()
+                    .and_then(|session| session.download_arbiter.clone());
+                let permit = if let Some(arbiter) = &arbiter {
+                    Some(loop {
+                        if let Ok(permit) = tokio::time::timeout(
+                            Duration::from_millis(250),
+                            arbiter.acquire(self.state.download_class(), request.length),
+                        )
+                        .await
+                        {
+                            break permit;
+                        }
+                    })
+                } else {
+                    None
+                };
                 self.state
                     .ratelimits
                     .prepare_for_download(NonZeroU32::new(request.length).unwrap())
@@ -2084,12 +2128,30 @@ impl PeerHandler {
 
                 aframe!(self.wait_for_request_slot()).await;
 
+                if let Some(arbiter) = &arbiter {
+                    arbiter.wait_allowed(self.state.download_class()).await;
+                }
+                if let Some(permit) = permit {
+                    let mut permits = self.download_permits.lock();
+                    match permits.entry((request.index, request.begin)) {
+                        std::collections::hash_map::Entry::Occupied(_) => continue,
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(permit);
+                        }
+                    }
+                }
+
                 if demand_only {
                     loop {
                         aframe!(self.wait_for_request_slot()).await;
                         match self.issue_stream_chunk(chunk, request)? {
                             StreamIssue::Issued => break,
-                            StreamIssue::Abandon => continue 'request_pieces,
+                            StreamIssue::Abandon => {
+                                self.download_permits
+                                    .lock()
+                                    .remove(&(request.index, request.begin));
+                                continue 'request_pieces;
+                            }
                             StreamIssue::Retry => tokio::task::yield_now().await,
                         }
                     }
@@ -2104,6 +2166,9 @@ impl PeerHandler {
                     }) {
                     Some(true) => {}
                     Some(false) => {
+                        self.download_permits
+                            .lock()
+                            .remove(&(request.index, request.begin));
                         // This request was already in-flight for this peer for this chunk.
                         // This might happen in theory, but not very likely.
                         //
@@ -2123,6 +2188,13 @@ impl PeerHandler {
                     None => return Ok(()),
                 };
 
+                if let Some(permit) = self
+                    .download_permits
+                    .lock()
+                    .get_mut(&(request.index, request.begin))
+                {
+                    permit.mark_issued();
+                }
                 if self
                     .tx
                     .send(WriterRequest::Message(Message::Request(request)))
@@ -2160,12 +2232,22 @@ impl PeerHandler {
                             };
                             if pieces.release_piece_owned_by(piece, self.addr) {
                                 live.cancel_inflight_requests_for_piece(piece);
+                                self.download_permits
+                                    .lock()
+                                    .retain(|(index, _), _| *index != piece.get());
                                 self.state.new_pieces_notify.notify_waiters();
                             }
                             return Ok(StreamIssue::Abandon);
                         }
 
                         if live.add_inflight_request(chunk) {
+                            if let Some(permit) = self
+                                .download_permits
+                                .lock()
+                                .get_mut(&(request.index, request.begin))
+                            {
+                                permit.mark_issued();
+                            }
                             self.tx
                                 .send(WriterRequest::Message(Message::Request(request)))
                                 .map_err(|_| Error::PeerTaskDead)?;
@@ -2209,6 +2291,13 @@ impl PeerHandler {
     }
 
     async fn on_received_piece(&self, piece: Piece<ByteBuf<'_>>) -> anyhow::Result<()> {
+        if let Some(permit) = self
+            .download_permits
+            .lock()
+            .remove(&(piece.index, piece.begin))
+        {
+            permit.received(piece.len() as u32);
+        }
         let piece_index = self
             .state
             .lengths
@@ -2410,6 +2499,14 @@ impl PeerHandler {
 
                     // Per-peer piece counters.
                     counters.on_piece_completed(piece_len, full_piece_download_time);
+                    if let Some(arbiter) = state
+                        .shared
+                        .session
+                        .upgrade()
+                        .and_then(|session| session.download_arbiter.clone())
+                    {
+                        arbiter.record_verified(state.download_class(), piece_len);
+                    }
                     state.peers.reset_peer_backoff(addr);
                     if state.shared.options.demand_only_streaming {
                         state.streams.record_verified(

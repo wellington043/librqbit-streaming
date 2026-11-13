@@ -107,3 +107,44 @@ has been introduced.
 
 See `crates/librqbit/tests/streaming_contract.rs` for a compiled external-consumer
 example with two loopback TCP peers and no desktop dependencies.
+
+## Shared request scheduling (streaming.2)
+
+Embedders may share one `DownloadArbiter` through `SessionOptions::download_arbiter`
+across independent sessions. `AddTorrentOptions::download_class` selects
+`Foreground`, `Preparation` or `Background`. With no arbiter, the original
+session behavior remains available. The caller must keep foreground activity
+and health current using `set_foreground`; the arbiter does not infer player
+buffer health from transfer speed.
+
+The three classes reserve at most 64, 8 and 4 outstanding payload requests.
+Unhealthy foreground playback blocks new preparation/background issuance;
+already issued requests can still complete. While foreground playback is
+healthy, preparation and background have explicit ceilings of 2 MiB/s and
+1 MiB/s. These are policy limits, not estimates of spare network capacity.
+Snapshots distinguish issued, received, verified, cancelled and in-flight bytes.
+
+## Reclaimable storage and selected-file import (streaming.2)
+
+Storage implementations can reserve piece capacity before requesting payload
+and provide `discard_range` for physical reclamation. The default discard
+implementation refuses unsupported operations. Filesystem storage punches sparse
+ranges on supported Windows/Linux filesystems and rejects destructive operations
+on multiply linked descriptors. An embedder must probe filesystem support and
+account for actual allocation; a logical file length does not measure disk use.
+
+`ManagedTorrent::reclaim_cached_pieces` requires a paused demand-only torrent.
+It retains active reader windows, durably publishes reduced verified bits via
+the caller's checkpoint callback, invalidates in-memory coverage, and only then
+discards storage. A failed checkpoint aborts before mutation; a later discard
+failure leaves verification cleared. The callback must replace every canonical
+checkpoint used on restart, including an all-zero bitfield. The API bounds each
+batch; `last_considered_piece` lets callers advance their selection without
+starving pieces beyond a retained prefix. Application-level pins and durable
+downloads remain the embedder's responsibility.
+
+`AddTorrentOptions::verify_selected_pieces` rehashes the selected file's boundary
+pieces independently of unrelated files. This supports owned compact boundary
+fragments during partial-download import. Existing saved claims are not trusted
+without hashing; this option does not waive source identity, file ownership or
+completion checks in the embedding application.

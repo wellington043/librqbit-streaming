@@ -39,7 +39,7 @@ use std::{
     path::Path,
 };
 
-use librqbit_core::lengths::ValidPieceIndex;
+pub use librqbit_core::lengths::ValidPieceIndex;
 
 use crate::torrent_state::{ManagedTorrentShared, TorrentMetadata};
 
@@ -130,6 +130,10 @@ impl<U: StorageFactory + ?Sized> StorageFactory for Box<U> {
 }
 
 pub trait TorrentStorage: Send + Sync {
+    /// Reserve physical capacity before requesting a piece; false applies backpressure.
+    fn reserve_piece(&self, _piece: u32, _length: u64) -> anyhow::Result<bool> {
+        Ok(true)
+    }
     // Create/open files etc.
     fn init(
         &mut self,
@@ -171,6 +175,12 @@ pub trait TorrentStorage: Send + Sync {
     /// E.g. for filesystem backend ensure that the file has a certain length, and grow/shrink as needed.
     fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()>;
 
+    /// Physically discard an exact file range without changing the logical length.
+    /// Callers must first durably invalidate its verified pieces and quiesce IO.
+    fn discard_range(&self, _file_id: usize, _offset: u64, _length: u64) -> anyhow::Result<()> {
+        anyhow::bail!("storage does not support physical range reclamation")
+    }
+
     /// Replace the current storage with a dummy, and return a new one that should be used instead.
     /// This is used to make the underlying object useless when e.g. pausing the torrent.
     fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>>;
@@ -183,6 +193,12 @@ pub trait TorrentStorage: Send + Sync {
 }
 
 impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
+    fn reserve_piece(&self, piece: u32, length: u64) -> anyhow::Result<bool> {
+        (**self).reserve_piece(piece, length)
+    }
+    fn discard_range(&self, file_id: usize, offset: u64, length: u64) -> anyhow::Result<()> {
+        (**self).discard_range(file_id, offset, length)
+    }
     fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
         (**self).pread_exact(file_id, offset, buf)
     }

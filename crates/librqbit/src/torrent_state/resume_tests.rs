@@ -15,6 +15,81 @@ use super::*;
 
 const PIECE_LEN: usize = 16_384;
 
+#[tokio::test]
+async fn reclaim_transaction_rejects_checkpoint_failure_and_pins_active_reader() {
+    let f = Fixture::new(6, true).await;
+    let handle = f
+        .session
+        .add_torrent(
+            AddTorrent::TorrentFileBytes(f.torrent_bytes.clone()),
+            Some(AddTorrentOptions {
+                overwrite: true,
+                paused: true,
+                demand_only_streaming: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_handle()
+        .unwrap();
+    handle.wait_until_initialized().await.unwrap();
+    assert!(
+        handle
+            .reclaim_cached_pieces(&[0], 0, |_| anyhow::bail!("disk full"))
+            .is_err()
+    );
+    assert_eq!(handle.stats().file_progress, [6 * PIECE_LEN as u64]);
+    let _reader = handle
+        .clone()
+        .stream_range(0, 0, PIECE_LEN as u64)
+        .await
+        .unwrap();
+    let report = handle
+        .reclaim_cached_pieces(&[0, 5], 0, |bits| {
+            assert_eq!(bits[0] & 4, 0);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(report.retained_pieces, 1);
+    assert_eq!(report.invalidated_pieces, 1);
+    assert_eq!(handle.stats().file_progress, [5 * PIECE_LEN as u64]);
+    f.session.stop().await;
+}
+
+#[tokio::test]
+async fn exact_selected_recheck_overrides_claimed_fastresume_bits() {
+    let f = Fixture::new(3, false).await;
+    f.init
+        .files
+        .pwrite_all(0, PIECE_LEN as u64, &[0; PIECE_LEN])
+        .unwrap();
+    f.save(f.bits(&[0, 1, 2])).await;
+    let handle = f
+        .session
+        .add_torrent(
+            AddTorrent::TorrentFileBytes(f.torrent_bytes.clone()),
+            Some(AddTorrentOptions {
+                overwrite: true,
+                paused: true,
+                verify_selected_pieces: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_handle()
+        .unwrap();
+    handle.wait_until_initialized().await.unwrap();
+    assert_eq!(
+        handle
+            .with_chunk_tracker(|ct| ct.get_have_pieces().as_bytes().to_vec())
+            .unwrap(),
+        [0xa0]
+    );
+    f.session.stop().await;
+}
+
 struct Fixture {
     root: tempfile::TempDir,
     session: Arc<Session>,

@@ -72,6 +72,15 @@ pub struct WriteThroughCacheStorage<U> {
 }
 
 impl<U: TorrentStorage> TorrentStorage for WriteThroughCacheStorage<U> {
+    fn reserve_piece(&self, piece: u32, length: u64) -> anyhow::Result<bool> {
+        self.underlying.reserve_piece(piece, length)
+    }
+    fn discard_range(&self, file_id: usize, offset: u64, length: u64) -> anyhow::Result<()> {
+        let mut cache = self.lru.write();
+        // Invalidate the memory copy before destructive IO, including on an IO error.
+        cache.clear();
+        self.underlying.discard_range(file_id, offset, length)
+    }
     fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
         let file = self.file_infos.get(file_id).context("wrong file")?;
         let current = self

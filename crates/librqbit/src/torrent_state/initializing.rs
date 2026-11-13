@@ -265,9 +265,55 @@ impl TorrentStateInitializing {
                 .context("error loading have_pieces")?
         };
 
-        let have_pieces = self
-            .validate_fastresume(&*bitv_factory, have_pieces)
-            .await?;
+        let have_pieces = if self.shared.options.verify_selected_pieces {
+            if let Some(previous) = have_pieces {
+                self.discard_fastresume(&*bitv_factory, previous).await;
+            }
+            let selected = compute_selected_pieces(
+                self.metadata.lengths(),
+                |index| {
+                    self.only_files
+                        .as_ref()
+                        .is_none_or(|files| files.contains(&index))
+                },
+                &self.metadata.file_infos,
+            );
+            let bits = self
+                .shared
+                .spawner
+                .block_in_place_with_semaphore(|| -> anyhow::Result<BF> {
+                    let lengths = self.metadata.lengths();
+                    let mut bits =
+                        BF::from_boxed_slice(vec![0u8; lengths.piece_bitfield_bytes()].into());
+                    let ops =
+                        FileOps::new(&self.metadata.info, &self.files, &self.metadata.file_infos);
+                    for index in selected.iter_ones() {
+                        if self.is_pause_requested() {
+                            bail!("initial check paused");
+                        }
+                        let piece = lengths
+                            .validate_piece_index(index.try_into()?)
+                            .context("invalid selected piece")?;
+                        if matches!(
+                            ops.check_piece_with_cancel(piece, &self.pause_requested),
+                            Ok(true)
+                        ) {
+                            bits.set(index, true);
+                        }
+                        self.checked_bytes
+                            .fetch_add(lengths.piece_length(piece) as u64, Ordering::Relaxed);
+                    }
+                    if self.is_pause_requested() {
+                        bail!("initial check paused");
+                    }
+                    Ok(bits)
+                })
+                .await?;
+            Some(bitv_factory.store_initial_check(id, bits).await?)
+        } else {
+            self.validate_fastresume(&*bitv_factory, have_pieces)
+                .await?
+        };
 
         let have_pieces = match have_pieces {
             Some(h) => h,
