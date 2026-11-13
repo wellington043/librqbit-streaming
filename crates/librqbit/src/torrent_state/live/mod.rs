@@ -1024,6 +1024,14 @@ impl TorrentStateLive {
     // We might have the torrent "finished" i.e. no selected files. But if someone is streaming files despite
     // them being selected, we aren't fully "finished".
     fn is_finished_and_no_active_streams(&self) -> bool {
+        if self
+            .shared
+            .session
+            .upgrade()
+            .is_some_and(|s| s.observation_only)
+        {
+            return false;
+        }
         self.is_finished()
             && !self.has_active_streams_unfinished_files(
                 &self.lock_read("is_finished_and_dont_need_peers"),
@@ -2014,6 +2022,17 @@ impl PeerHandler {
         };
 
         'request_pieces: loop {
+            if self
+                .state
+                .shared
+                .session
+                .upgrade()
+                .is_some_and(|s| s.observation_only)
+            {
+                update_interest(self, false)?;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
             if demand_only {
                 self.release_obsolete_stream_requests();
             }
@@ -2141,6 +2160,15 @@ impl PeerHandler {
                     }
                 }
 
+                // Reserve before any request can reach a peer. A charged request
+                // remains charged even when preempted, lost, or retried.
+                if let Some(session) = self.state.shared.session.upgrade()
+                    && let Some(budget) = &session.payload_budget
+                    && !budget.try_reserve(u64::from(request.length))
+                {
+                    session.cancellation_token().cancel();
+                    return Err(Error::Disconnect);
+                }
                 if demand_only {
                     loop {
                         aframe!(self.wait_for_request_slot()).await;

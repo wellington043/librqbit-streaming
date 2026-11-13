@@ -106,6 +106,35 @@ impl SessionDatabase {
     }
 }
 
+/// Cumulative payload bytes authorized for outgoing block requests. Reservations
+/// are never refunded, including on retry or disconnect. Protocol and unsolicited
+/// traffic are not included.
+#[derive(Debug)]
+pub struct PayloadBudget {
+    limit: u64,
+    reserved: std::sync::atomic::AtomicU64,
+}
+impl PayloadBudget {
+    pub fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            reserved: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+    pub fn reserved(&self) -> u64 {
+        self.reserved.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn try_reserve(&self, bytes: u64) -> bool {
+        self.reserved
+            .try_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |used| used.checked_add(bytes).filter(|next| *next <= self.limit),
+            )
+            .is_ok()
+    }
+}
+
 pub struct Session {
     // Core state and services
     pub(crate) db: RwLock<SessionDatabase>,
@@ -122,6 +151,11 @@ pub struct Session {
     reqwest_client: reqwest::Client,
     udp_tracker_client: UdpTrackerClient,
     disable_trackers: bool,
+    tracker_observer: Option<tracker_comms::TrackerObserver>,
+    pub(crate) payload_budget: Option<Arc<PayloadBudget>>,
+    single_tracker_discovery: bool,
+    pub(crate) observation_only: bool,
+    metadata_size_limit: u32,
 
     // Lifecycle management
     cancellation_token: CancellationToken,
@@ -154,6 +188,15 @@ pub struct Session {
     pub ipv4_only: bool,
     pub peer_limit: Option<usize>,
     client_name_and_version: String,
+}
+
+fn ordered_discovery_trackers(mut trackers: Vec<url::Url>, single: bool) -> Vec<url::Url> {
+    let mut seen = HashSet::new();
+    trackers.retain(|url| seen.insert(url.clone()));
+    if single {
+        trackers.truncate(1);
+    }
+    trackers
 }
 
 /// A 40 character hex string is a v1 info hash. Checking the length alone
@@ -450,6 +493,21 @@ pub struct SessionOptions {
     /// Disable tracker communication
     pub disable_trackers: bool,
 
+    /// Optional bounded tracker announce observer; disabled by default.
+    pub tracker_observer: Option<tracker_comms::TrackerObserver>,
+
+    /// Optional cumulative limit for outgoing payload requests.
+    pub payload_budget: Option<Arc<PayloadBudget>>,
+
+    /// Restrict discovery to the first tracker even before magnet privacy is known.
+    pub single_tracker_discovery: bool,
+
+    /// Keep peer bitfields observable while forbidding all payload requests.
+    pub observation_only: bool,
+
+    /// Maximum metadata bytes accepted from any one peer.
+    pub metadata_size_limit: u32,
+
     /// Enable fastresume, to restore state quickly after restart.
     pub fastresume: bool,
 
@@ -511,6 +569,11 @@ impl Default for SessionOptions {
             dht: Some(DhtSessionConfig::default()),
             bind_device_name: None,
             disable_trackers: false,
+            tracker_observer: None,
+            payload_budget: None,
+            single_tracker_discovery: false,
+            observation_only: false,
+            metadata_size_limit: 32 * 1024 * 1024,
             fastresume: false,
             persistence: None,
             peer_id: None,
@@ -829,6 +892,11 @@ impl Session {
                 ipv4_only: opts.ipv4_only,
                 trackers: opts.trackers,
                 disable_trackers: opts.disable_trackers,
+                tracker_observer: opts.tracker_observer,
+                payload_budget: opts.payload_budget,
+                single_tracker_discovery: opts.single_tracker_discovery,
+                observation_only: opts.observation_only,
+                metadata_size_limit: opts.metadata_size_limit.clamp(1, 32 * 1024 * 1024),
                 peer_limit: opts.peer_limit,
                 client_name_and_version,
 
@@ -1120,6 +1188,11 @@ impl Session {
     ) -> BoxFuture<'a, anyhow::Result<AddTorrentResponse>> {
         async move {
             let mut opts = opts.unwrap_or_default();
+            if self.observation_only {
+                opts.only_files = Some(Vec::new());
+                opts.only_files_regex = None;
+                opts.demand_only_streaming = true;
+            }
             let add_res = match add {
                 AddTorrent::Url(magnet)
                     if magnet.starts_with("magnet:") || is_bare_info_hash(&magnet) =>
@@ -1177,7 +1250,9 @@ impl Session {
                             }
                         })
                         .collect::<Vec<_>>();
-                    if let Some(custom_trackers) = opts.trackers.clone() {
+                    if !torrent.meta.info.data.private
+                        && let Some(custom_trackers) = opts.trackers.clone()
+                    {
                         trackers.extend(custom_trackers);
                     }
 
@@ -1287,7 +1362,13 @@ impl Session {
                         "no known way to resolve peers (no DHT, no trackers, no initial_peers)",
                     )?;
                     let resolved_magnet = self
-                        .resolve_magnet(info_hash, peer_rx, &trackers, opts.peer_opts)
+                        .resolve_magnet(
+                            info_hash,
+                            peer_rx,
+                            &trackers,
+                            opts.peer_opts,
+                            opts.peer_limit.or(self.peer_limit).unwrap_or(128),
+                        )
                         .await?;
 
                     // Add back seen_peers into the peer stream, as we consumed some peers
@@ -1373,6 +1454,7 @@ impl Session {
                 id,
                 span,
                 info_hash,
+                ordered_trackers: trackers.clone(),
                 trackers: trackers.into_iter().collect(),
                 spawner: self.spawner.clone(),
                 peer_id: self.peer_id,
@@ -1551,7 +1633,7 @@ impl Session {
         let is_private = t.with_metadata(|m| m.info.info().private).unwrap_or(false);
         self.make_peer_rx(
             t.info_hash(),
-            t.shared().trackers.iter().cloned().collect(),
+            t.shared().ordered_trackers.clone(),
             announce,
             t.shared().options.force_tracker_interval,
             t.shared().options.initial_peers.clone(),
@@ -1589,21 +1671,17 @@ impl Session {
             trackers.clear();
         }
 
-        if is_private && trackers.len() > 1 {
-            warn!(
-                ?info_hash,
-                "private trackers are not fully implemented, so using only the first tracker"
-            );
-            trackers.truncate(1);
-        } else if !self.disable_trackers {
+        if !is_private && !self.single_tracker_discovery && !self.disable_trackers {
             trackers.extend(self.trackers.iter().cloned());
         }
+        let trackers =
+            ordered_discovery_trackers(trackers, is_private || self.single_tracker_discovery);
 
         let tracker_rx_stats = PeerRxTorrentInfo {
             info_hash,
             session: self.clone(),
         };
-        let tracker_rx = TrackerComms::start(
+        let tracker_rx = TrackerComms::start_with_observer(
             info_hash,
             self.peer_id,
             trackers.into_iter().collect(),
@@ -1612,6 +1690,7 @@ impl Session {
             self.announce_port().unwrap_or(4240),
             self.reqwest_client.clone(),
             self.udp_tracker_client.clone(),
+            self.tracker_observer.clone(),
         );
 
         let initial_peers_rx = if initial_peers.is_empty() {
@@ -1673,6 +1752,7 @@ impl Session {
         peer_rx: PeerStream,
         trackers: &[url::Url],
         peer_opts: Option<PeerConnectionOptions>,
+        peer_limit: usize,
     ) -> anyhow::Result<ResolveMagnetResult> {
         match read_metainfo_from_peer_receiver(
             self.peer_id,
@@ -1682,6 +1762,8 @@ impl Session {
             Some(self.merge_peer_opts(peer_opts)),
             self.connector.clone(),
             self.client_name_and_version.clone(),
+            peer_limit,
+            self.metadata_size_limit,
         )
         .await
         {
@@ -1884,5 +1966,52 @@ mod tests {
         assert_eq!(parsed.info_hash, generated_parsed.info_hash);
         assert_eq!(parsed.info, generated_parsed.info);
         assert_eq!(parsed_trackers, get_trackers(&generated_parsed));
+    }
+}
+
+#[cfg(test)]
+mod catalog_tracker_observer_tests {
+    #[test]
+    fn default_tracker_observer_is_disabled() {
+        assert!(super::SessionOptions::default().tracker_observer.is_none());
+    }
+}
+
+#[cfg(test)]
+mod catalog_payload_budget_tests {
+    #[test]
+    fn concurrent_requests_never_exceed_payload_allowance() {
+        let budget = std::sync::Arc::new(super::PayloadBudget::new(16384));
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let b = budget.clone();
+                std::thread::spawn(move || b.try_reserve(2048))
+            })
+            .collect();
+        let accepted = threads
+            .into_iter()
+            .map(|v| v.join().unwrap())
+            .filter(|v| *v)
+            .count();
+        assert_eq!(accepted, 8);
+        assert_eq!(budget.reserved(), 16384);
+    }
+}
+
+#[cfg(test)]
+mod catalog_private_tracker_tests {
+    #[test]
+    fn private_discovery_keeps_original_first_tracker_only() {
+        let urls = [
+            "https://first.example/a",
+            "https://second.example/b",
+            "https://first.example/a",
+        ]
+        .into_iter()
+        .map(|u| url::Url::parse(u).unwrap())
+        .collect();
+        let selected = super::ordered_discovery_trackers(urls, true);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].host_str(), Some("first.example"));
     }
 }

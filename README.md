@@ -17,6 +17,7 @@ This is an experimental fork. The first milestone focuses on library APIs, corre
 - Shared payload-request arbitration across foreground, preparation and background sessions.
 - Paused, checkpoint-first piece reclamation with reader retention and sparse storage support.
 - Independent selected-piece verification for importing existing partial downloads.
+- Opt-in observation-only sessions, sanitized tracker reply observations, and bounded metadata and solicited-payload budgets.
 
 Normal downloads and seeding remain supported. Existing `stream` and `stream_range` callers retain their interfaces. Set `AddTorrentOptions::demand_only_streaming` to opt into the streaming scheduler. Fast resume is a separate session option and remains disabled by default.
 

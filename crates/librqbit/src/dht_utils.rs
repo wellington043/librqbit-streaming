@@ -27,6 +27,7 @@ pub enum ReadMetainfoResult<Rx> {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unpin>(
     peer_id: Id20,
     info_hash: Id20,
@@ -35,11 +36,15 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
     peer_connection_options: Option<PeerConnectionOptions>,
     connector: Arc<StreamConnector>,
     client_name_and_version: String,
+    peer_limit: usize,
+    metadata_size_limit: u32,
 ) -> ReadMetainfoResult<A> {
     let mut seen = HashSet::<SocketAddr>::new();
     let mut addrs = addrs_stream;
 
-    let semaphore = tokio::sync::Semaphore::new(128);
+    let peer_limit = peer_limit.clamp(1, 128);
+    let seen_limit = peer_limit.saturating_mul(64);
+    let semaphore = tokio::sync::Semaphore::new(peer_limit);
 
     let read_info_guarded = |addr| {
         let semaphore = &semaphore;
@@ -57,6 +62,7 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
                 BlockingSpawner::new(1),
                 connector,
                 client_name_and_version,
+                metadata_size_limit,
             )
             .instrument(debug_span!("read_metainfo_from_peer", ?addr))
             .await
@@ -68,7 +74,7 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
 
     let mut unordered = FuturesUnordered::new();
 
-    for a in initial_addrs {
+    for a in initial_addrs.into_iter().take(peer_limit) {
         seen.insert(a);
         unordered.push(read_info_guarded(a));
     }
@@ -91,11 +97,12 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
                 }
             }
 
-            next_addr = addrs.next(), if !addrs_completed => {
+            next_addr = addrs.next(), if !addrs_completed && unordered.len() < peer_limit => {
                 match next_addr {
                     Some(addr) => {
                         if seen.insert(addr) {
                             unordered.push(read_info_guarded(addr));
+                            if seen.len() >= seen_limit { addrs_completed = true; }
                         }
                         continue;
                     },
@@ -146,6 +153,8 @@ mod tests {
             None,
             Arc::new(StreamConnector::new(Default::default()).await.unwrap()),
             crate::client_name_and_version().to_owned(),
+            128,
+            32 * 1024 * 1024,
         )
         .await
         {

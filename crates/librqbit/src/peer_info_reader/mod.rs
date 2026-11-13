@@ -30,6 +30,7 @@ use crate::{
     stream_connect::{ConnectionKind, StreamConnector},
 };
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn read_metainfo_from_peer(
     addr: SocketAddr,
     peer_id: Id20,
@@ -38,6 +39,7 @@ pub(crate) async fn read_metainfo_from_peer(
     spawner: BlockingSpawner,
     connector: Arc<StreamConnector>,
     client_name_and_version: String,
+    metadata_size_limit: u32,
 ) -> anyhow::Result<TorrentAndInfoBytes> {
     let (result_tx, result_rx) = tokio::sync::oneshot::channel::<
         Result<(TorrentMetaV1Info<ByteBufOwned>, ByteBufOwned), bencode::DeserializeError>,
@@ -50,6 +52,7 @@ pub(crate) async fn read_metainfo_from_peer(
         result_tx: Mutex::new(Some(result_tx)),
         locked: RwLock::new(None),
         client_name_and_version,
+        metadata_size_limit,
     };
     let connection = PeerConnection::new(
         addr,
@@ -83,8 +86,8 @@ struct HandlerLocked {
 }
 
 impl HandlerLocked {
-    fn new(metadata_size: u32) -> anyhow::Result<Self> {
-        if metadata_size > 32 * 1024 * 1024 {
+    fn new(metadata_size: u32, limit: u32) -> anyhow::Result<Self> {
+        if metadata_size == 0 || metadata_size > limit.min(32 * 1024 * 1024) {
             anyhow::bail!("metadata size {} is too big", metadata_size);
         }
         let buffer = vec![0u8; metadata_size as usize];
@@ -160,6 +163,7 @@ struct Handler {
     >,
     locked: RwLock<Option<HandlerLocked>>,
     client_name_and_version: String,
+    metadata_size_limit: u32,
 }
 
 impl PeerConnectionHandler for Handler {
@@ -240,7 +244,7 @@ impl PeerConnectionHandler for Handler {
         self.writer_tx
             .send(WriterRequest::Message(Message::Interested))?;
 
-        let inner = HandlerLocked::new(metadata_size)?;
+        let inner = HandlerLocked::new(metadata_size, self.metadata_size_limit)?;
         let total_pieces = inner.total_pieces;
 
         self.locked.write().replace(inner);
@@ -260,5 +264,14 @@ impl PeerConnectionHandler for Handler {
 
     fn client_name_and_version(&self) -> &str {
         &self.client_name_and_version
+    }
+}
+
+#[cfg(test)]
+mod catalog_metadata_limit_tests {
+    #[test]
+    fn rejects_announced_metadata_above_limit_before_allocating() {
+        assert!(super::HandlerLocked::new(2_097_153, 2_097_152).is_err());
+        assert!(super::HandlerLocked::new(2_097_152, 2_097_152).is_ok());
     }
 }

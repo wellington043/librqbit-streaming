@@ -148,3 +148,32 @@ pieces independently of unrelated files. This supports owned compact boundary
 fragments during partial-download import. Existing saved claims are not trusted
 without hashing; this option does not waive source identity, file ownership or
 completion checks in the embedding application.
+
+
+## Catalog observation controls (streaming.3)
+
+All controls are session-scoped and disabled by default unless stated otherwise.
+`SessionOptions::observation_only` forces an empty selected-file list and the
+request loop sends no payload block requests, while keeping connected peer
+bitfields observable. Embedders must still bound session lifetime and peers.
+
+`tracker_observer` is an optional callback for each parsed HTTP or UDP announce
+reply. Its endpoint contains only scheme, host and port; tracker path, query,
+credentials and error details are excluded. Success, reply latency and count of
+returned addresses are observations, not a claim that those peers are useful.
+The callback is invoked before forwarding addresses and must be nonblocking.
+HTTP tracker response bodies are read incrementally and rejected above 2 MiB.
+
+`single_tracker_discovery` limits discovery to the first ordered tracker even
+before magnet privacy is known. Private metainfo also uses only its first
+original tracker and never adds custom or global trackers; sequential tier
+fallback is not implemented. DHT and local discovery remain separate session
+options. Magnet metadata resolution honors the peer limit and bounds its seen
+address set. `metadata_size_limit` rejects larger announced peer metadata before
+allocation; the default remains 32 MiB and the hard maximum is 32 MiB.
+
+`payload_budget` optionally reserves each outgoing block request atomically and
+never refunds retries or preempted requests. The cap bounds the sum of solicited
+payload lengths; it does not count tracker messages, protocol overhead, or
+unsolicited network bytes. A failed reservation cancels the session. This is
+not a replacement for an embedder's process, disk, memory or network sandbox.

@@ -147,6 +147,7 @@ impl Fixture {
             info_hash: torrent.info_hash(),
             spawner,
             trackers: Default::default(),
+            ordered_trackers: Default::default(),
             peer_id: librqbit_core::Id20::new([0; 20]),
             span: tracing::Span::none(),
             options: ManagedTorrentOptions {

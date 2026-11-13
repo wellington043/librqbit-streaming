@@ -96,7 +96,7 @@ pub use listen::{ListenerMode, ListenerOptions};
 pub use peer_connection::PeerConnectionOptions;
 pub use session::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListOnlyResponse,
-    SUPPORTED_SCHEMES, Session, SessionOptions, SessionPersistenceConfig,
+    PayloadBudget, SUPPORTED_SCHEMES, Session, SessionOptions, SessionPersistenceConfig,
 };
 pub use stream_connect::ConnectionOptions;
 pub use torrent_state::{
@@ -115,6 +115,7 @@ pub use clone_to_owned::CloneToOwned;
 pub use librqbit_core::magnet::*;
 pub use librqbit_core::peer_id::*;
 pub use librqbit_core::torrent_metainfo::*;
+pub use tracker_comms::{TrackerObservation, TrackerObserver};
 
 #[cfg(test)]
 mod tests;
@@ -129,8 +130,16 @@ pub const fn client_name_and_version() -> &'static str {
 }
 
 /// Local source revision. The protocol and upstream package version remain 9.1.0.
-pub const LOCAL_REVISION: &str = "librqbit-streaming.2";
+pub const LOCAL_REVISION: &str = "librqbit-streaming.3";
 
 pub fn try_increase_nofile_limit() -> anyhow::Result<u64> {
     Ok(rlimit::increase_nofile_limit(1024 * 1024)?)
+}
+
+#[cfg(test)]
+mod catalog_revision_contract {
+    #[test]
+    fn exposes_streaming_revision_three() {
+        assert_eq!(crate::LOCAL_REVISION, "librqbit-streaming.3");
+    }
 }
