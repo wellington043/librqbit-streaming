@@ -110,13 +110,24 @@ pub struct AnnounceResponse {
     pub addrs: Vec<SocketAddr>,
 }
 
-#[derive(Debug)]
 pub enum Response {
     Connect(ConnectionId),
     Announce(AnnounceResponse),
     #[allow(dead_code)]
     Error(String),
     Unknown,
+}
+
+impl std::fmt::Debug for Response {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connect(id) => f.debug_tuple("Connect").field(id).finish(),
+            Self::Announce(response) => f.debug_tuple("Announce").field(response).finish(),
+            // Tracker-controlled error text may include passkeys or other secrets.
+            Self::Error(_) => f.write_str("Error(<redacted>)"),
+            Self::Unknown => f.write_str("Unknown"),
+        }
+    }
 }
 
 fn split_slice(s: &[u8], first_len: usize) -> Option<(&[u8], &[u8])> {
@@ -499,5 +510,16 @@ mod tests {
             }
             other => panic!("unexpected response {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod catalog_udp_redaction_tests {
+    #[test]
+    fn tracker_error_debug_never_exposes_server_text() {
+        let response = super::Response::Error("passkey=owned-secret".into());
+        let diagnostic = format!("{response:?}");
+        assert!(!diagnostic.contains("owned-secret"));
+        assert!(!diagnostic.contains("passkey"));
     }
 }

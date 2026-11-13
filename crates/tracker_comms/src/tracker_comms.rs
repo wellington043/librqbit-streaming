@@ -48,6 +48,47 @@ fn sanitized_tracker_endpoint(url: &Url) -> String {
         None => format!("{}://{}", url.scheme(), host),
     }
 }
+/// A single tracker-only catalog attempt. The URL is used intact on the wire.
+/// Callers must drain the previous session before using another tracker.
+#[derive(Clone)]
+pub struct TrackerAttempt {
+    pub url: Url,
+    pub timeout: Duration,
+}
+impl std::fmt::Debug for TrackerAttempt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrackerAttempt")
+            .field("endpoint", &sanitized_tracker_endpoint(&self.url))
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+/// BEP 12 candidate order for one bounded catalog pass. Tiers stay ordered;
+/// only members within a tier are shuffled. Original metainfo is never edited.
+pub struct TrackerDiscoveryPlan {
+    candidates: std::vec::IntoIter<Url>,
+}
+impl TrackerDiscoveryPlan {
+    pub fn new(mut tiers: Vec<Vec<Url>>) -> Self {
+        use rand::seq::SliceRandom;
+        let mut seen = HashSet::new();
+        for tier in &mut tiers {
+            tier.retain(|url| seen.insert(url.clone()));
+            tier.shuffle(&mut rand::rng());
+        }
+        Self {
+            candidates: tiers.into_iter().flatten().collect::<Vec<_>>().into_iter(),
+        }
+    }
+}
+impl Iterator for TrackerDiscoveryPlan {
+    type Item = Url;
+    fn next(&mut self) -> Option<Url> {
+        self.candidates.next()
+    }
+}
+
 const MAX_TRACKER_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 async fn read_tracker_response_bounded(mut response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
@@ -132,8 +173,8 @@ enum SupportedTracker {
 impl std::fmt::Debug for SupportedTracker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SupportedTracker::Udp(u) => std::fmt::Display::fmt(u, f),
-            SupportedTracker::Http(u) => std::fmt::Display::fmt(u, f),
+            SupportedTracker::Udp(u) => f.write_str(&sanitized_tracker_endpoint(u)),
+            SupportedTracker::Http(u) => f.write_str(&sanitized_tracker_endpoint(u)),
         }
     }
 }
@@ -180,6 +221,54 @@ async fn udp_tracker_to_socket_addrs(
 }
 
 impl TrackerComms {
+    /// Performs exactly one bounded announce, including DNS and response body.
+    /// Dropping this stream cancels its request; it never spawns a retry task.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_attempt(
+        info_hash: Id20,
+        peer_id: Id20,
+        attempt: TrackerAttempt,
+        stats: Box<dyn TorrentStatsProvider>,
+        announce_port: u16,
+        reqwest_client: reqwest::Client,
+        udp_client: UdpTrackerClient,
+        observer: Option<TrackerObserver>,
+    ) -> BoxStream<'static, SocketAddr> {
+        async_stream::stream! {
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            let comms = Self { info_hash, peer_id, stats, force_tracker_interval: None,
+                tx, announce_port, reqwest_client, key: rand::random(), observer };
+            let started = Instant::now();
+            let response = tokio::time::timeout(attempt.timeout, async {
+                match attempt.url.scheme() {
+                    "http" | "https" => comms.fetch_http(&attempt.url,
+                        Some(tracker_comms_http::TrackerRequestEvent::Started)).await,
+                    "udp" => {
+                        let host = attempt.url.host().context("missing tracker host")?;
+                        let port = attempt.url.port().context("missing tracker port")?;
+                        match udp_tracker_to_socket_addrs(host, port).await? {
+                            UdpTrackerResolveResult::One(addr) => comms.fetch_udp(addr, &udp_client).await,
+                            UdpTrackerResolveResult::Two(v4, v6) => {
+                                match comms.fetch_udp(v4.into(), &udp_client).await {
+                                    Ok(value) => Ok(value),
+                                    Err(_) => comms.fetch_udp(v6.into(), &udp_client).await,
+                                }
+                            }
+                        }
+                    }
+                    _ => anyhow::bail!("unsupported tracker scheme"),
+                }
+            }).await;
+            match response {
+                Ok(Ok((_, peers))) => {
+                    comms.observe(&attempt.url, started, Some(peers.len()));
+                    for peer in peers { yield peer; }
+                }
+                _ => comms.observe(&attempt.url, started, None),
+            }
+        }.boxed()
+    }
+
     // TODO: fix too many args
     #[allow(clippy::too_many_arguments)]
     pub fn start(
@@ -223,7 +312,10 @@ impl TrackerComms {
                 "http" | "https" => Some(SupportedTracker::Http(t)),
                 "udp" => Some(SupportedTracker::Udp(t)),
                 _ => {
-                    debug!("unsupported tracker URL: {}", t);
+                    debug!(
+                        "unsupported tracker URL: {}",
+                        sanitized_tracker_endpoint(&t)
+                    );
                     None
                 }
             })
@@ -284,7 +376,7 @@ impl TrackerComms {
         let info_hash = self.info_hash;
         match url {
             SupportedTracker::Udp(url) => {
-                let span = debug_span!(parent: None, "udp_tracker", tracker = %url, info_hash = ?info_hash);
+                let span = debug_span!(parent: None, "udp_tracker", tracker = %sanitized_tracker_endpoint(&url), info_hash = ?info_hash);
                 self.task_single_tracker_monitor_udp(url, client.clone())
                     .instrument(span)
                     .right_future()
@@ -293,7 +385,7 @@ impl TrackerComms {
                 let span = debug_span!(
                     parent: None,
                     "http_tracker",
-                    tracker = %url,
+                    tracker = %sanitized_tracker_endpoint(&url),
                     info_hash = ?info_hash
                 );
                 self.task_single_tracker_monitor_http(url)
@@ -304,7 +396,7 @@ impl TrackerComms {
     }
 
     async fn task_single_tracker_monitor_http(&self, tracker_url: Url) -> anyhow::Result<()> {
-        trace!(url=%tracker_url, "starting monitor");
+        trace!(endpoint=%sanitized_tracker_endpoint(&tracker_url), "starting monitor");
         let mut event = Some(tracker_comms_http::TrackerRequestEvent::Started);
 
         loop {
@@ -361,6 +453,21 @@ impl TrackerComms {
         event: Option<tracker_comms_http::TrackerRequestEvent>,
         started: Instant,
     ) -> anyhow::Result<Duration> {
+        let (interval, peers) = self.fetch_http(tracker_url, event).await?;
+        self.observe(tracker_url, started, Some(peers.len()));
+        for peer in peers {
+            if self.tx.send(peer).await.is_err() {
+                break;
+            }
+        }
+        Ok(interval)
+    }
+
+    async fn fetch_http(
+        &self,
+        tracker_url: &Url,
+        event: Option<tracker_comms_http::TrackerRequestEvent>,
+    ) -> anyhow::Result<(Duration, Vec<SocketAddr>)> {
         let stats = self.stats.get();
         let request = tracker_comms_http::TrackerRequest {
             info_hash: &self.info_hash,
@@ -386,35 +493,32 @@ impl TrackerComms {
         }
         url.set_query(Some(&queries));
 
-        let response: reqwest::Response = self.reqwest_client.get(url).send().await?;
+        let response: reqwest::Response = self
+            .reqwest_client
+            .get(url)
+            .send()
+            .await
+            .map_err(|_| anyhow::anyhow!("tracker request failed"))?;
         if !response.status().is_success() {
             anyhow::bail!("tracker responded with {:?}", response.status());
         }
-        let bytes = read_tracker_response_bounded(response).await?;
+        let bytes = read_tracker_response_bounded(response)
+            .await
+            .map_err(|_| anyhow::anyhow!("tracker response could not be read"))?;
         if let Ok((error, _)) =
             bencode::from_bytes_with_rest::<tracker_comms_http::TrackerError>(&bytes)
         {
-            anyhow::bail!(
-                "tracker returned failure. Failure reason: {}",
-                error.failure_reason
-            )
+            // Tracker-supplied text can contain a passkey; never write it to logs.
+            let _ = error.failure_reason;
+            anyhow::bail!("tracker returned failure")
         };
         let response = bencode::from_bytes_with_rest::<tracker_comms_http::TrackerResponse>(&bytes)
-            .map_err(|e| {
-                tracing::trace!("error deserializing TrackerResponse: {e:#}");
-                e.into_kind()
-            })?
+            .map_err(|_| anyhow::anyhow!("invalid tracker response"))?
             .0;
 
-        let peers_returned = response.iter_peers().count();
-        self.observe(tracker_url, started, Some(peers_returned));
-        for peer in response.iter_peers() {
-            if self.tx.send(peer).await.is_err() {
-                break;
-            }
-        }
-        Ok(Duration::from_secs(
-            response.min_interval.unwrap_or(response.interval),
+        Ok((
+            Duration::from_secs(response.min_interval.unwrap_or(response.interval)),
+            response.iter_peers().collect(),
         ))
     }
 
@@ -424,7 +528,7 @@ impl TrackerComms {
         client: UdpTrackerClient,
     ) -> anyhow::Result<()> {
         if url.scheme() != "udp" {
-            bail!("expected UDP scheme in {}", url);
+            bail!("expected UDP tracker scheme");
         }
         let (host, port) = (
             url.host().context("missing host")?,
@@ -512,6 +616,21 @@ impl TrackerComms {
         url: &Url,
         started: Instant,
     ) -> anyhow::Result<Duration> {
+        let (interval, peers) = self.fetch_udp(addr, client).await?;
+        self.observe(url, started, Some(peers.len()));
+        for peer in peers {
+            if self.tx.send(peer).await.is_err() {
+                break;
+            }
+        }
+        Ok(interval)
+    }
+
+    async fn fetch_udp(
+        &self,
+        addr: SocketAddr,
+        client: &UdpTrackerClient,
+    ) -> anyhow::Result<(Duration, Vec<SocketAddr>)> {
         use tracker_comms_udp::*;
 
         let stats = self.stats.get();
@@ -537,29 +656,27 @@ impl TrackerComms {
             port: self.announce_port,
         };
 
-        match client.announce(addr, request).await {
-            Ok(response) => {
-                trace!(len = response.addrs.len(), "received announce response");
-                let peers_returned = response.addrs.len();
-                self.observe(url, started, Some(peers_returned));
-                for addr in response.addrs {
-                    if self.tx.send(addr).await.is_err() {
-                        break;
-                    }
-                }
-                let sleep = response.interval.max(5);
-                Ok(Duration::from_secs(sleep as u64))
-            }
-            Err(e) => {
-                debug!(?addr, "error reading announce response: {e:#}");
-                Err(e)
-            }
-        }
+        let response = client
+            .announce(addr, request)
+            .await
+            .map_err(|_| anyhow::anyhow!("UDP tracker request failed"))?;
+        Ok((
+            Duration::from_secs(response.interval.max(5) as u64),
+            response.addrs,
+        ))
     }
 }
 
 #[cfg(test)]
 mod catalog_observation_tests {
+    #[test]
+    fn supported_tracker_debug_never_exposes_credentials_or_passkey() {
+        let url =
+            url::Url::parse("https://user:secret@tracker.example/passkey/announce?token=private")
+                .unwrap();
+        let debug = format!("{:?}", super::SupportedTracker::Http(url));
+        assert_eq!(debug, "https://tracker.example");
+    }
     use super::*;
 
     #[tokio::test]
@@ -649,5 +766,105 @@ mod catalog_observation_tests {
             sanitized_tracker_endpoint(&url),
             "https://tracker.example:9443"
         );
+    }
+}
+
+#[cfg(test)]
+mod catalog_attempt_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn bounded_attempt_timeout_observes_one_failure_and_closes_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!(
+            "http://{}/passkey?secret=value",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 4096];
+            assert!(sock.read(&mut buf).await.unwrap() > 0);
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+        });
+        let token = tokio_util::sync::CancellationToken::new();
+        let _guard = token.clone().drop_guard();
+        let udp = UdpTrackerClient::new(token, None).await.unwrap();
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collector = observations.clone();
+        let stream = TrackerComms::start_attempt(
+            Id20::new([1; 20]),
+            Id20::new([2; 20]),
+            TrackerAttempt {
+                url,
+                timeout: Duration::from_millis(100),
+            },
+            Box::new(()),
+            4240,
+            reqwest::Client::new(),
+            udp,
+            Some(Arc::new(move |v| collector.lock().unwrap().push(v))),
+        );
+        assert!(stream.collect::<Vec<_>>().await.is_empty());
+        server.await.unwrap();
+        let events = observations.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(!events[0].succeeded);
+        assert_eq!(events[0].peers_returned, None);
+        assert!(!format!("{:?}", events[0]).contains("passkey"));
+    }
+
+    #[tokio::test]
+    async fn dropped_attempt_cancels_request_without_reporting_tracker_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!(
+            "http://{}/announce",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 4096];
+            assert!(sock.read(&mut buf).await.unwrap() > 0);
+            received_tx.send(()).unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+            let _ = sock.shutdown().await;
+        });
+        let token = tokio_util::sync::CancellationToken::new();
+        let _guard = token.clone().drop_guard();
+        let udp = UdpTrackerClient::new(token, None).await.unwrap();
+        let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collector = observations.clone();
+        let mut stream = TrackerComms::start_attempt(
+            Id20::new([1; 20]),
+            Id20::new([2; 20]),
+            TrackerAttempt {
+                url,
+                timeout: Duration::from_secs(10),
+            },
+            Box::new(()),
+            4240,
+            reqwest::Client::new(),
+            udp,
+            Some(Arc::new(move |v| collector.lock().unwrap().push(v))),
+        );
+        tokio::select! { _=received_rx=>{}, _=stream.next()=>panic!("unexpected tracker response") }
+        drop(stream);
+        server.await.unwrap();
+        assert!(observations.lock().unwrap().is_empty());
     }
 }

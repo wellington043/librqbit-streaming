@@ -154,10 +154,12 @@ pub struct Session {
     tracker_observer: Option<tracker_comms::TrackerObserver>,
     pub(crate) payload_budget: Option<Arc<PayloadBudget>>,
     single_tracker_discovery: bool,
+    pub(crate) tracker_attempt: Option<tracker_comms::TrackerAttempt>,
     pub(crate) observation_only: bool,
     metadata_size_limit: u32,
 
     // Lifecycle management
+    pub(crate) tasks: crate::spawn_utils::TaskGroup,
     cancellation_token: CancellationToken,
     _cancellation_token_drop_guard: DropGuard,
 
@@ -502,6 +504,10 @@ pub struct SessionOptions {
     /// Restrict discovery to the first tracker even before magnet privacy is known.
     pub single_tracker_discovery: bool,
 
+    /// One bounded tracker-only announce. No DHT, LSD, PEX or initial peers.
+    /// Recreate and stop the session between attempts; metainfo remains intact.
+    pub tracker_attempt: Option<tracker_comms::TrackerAttempt>,
+
     /// Keep peer bitfields observable while forbidding all payload requests.
     pub observation_only: bool,
 
@@ -572,6 +578,7 @@ impl Default for SessionOptions {
             tracker_observer: None,
             payload_budget: None,
             single_tracker_discovery: false,
+            tracker_attempt: None,
             observation_only: false,
             metadata_size_limit: 32 * 1024 * 1024,
             fastresume: false,
@@ -876,6 +883,7 @@ impl Session {
                 db: RwLock::new(Default::default()),
                 _cancellation_token_drop_guard: token.clone().drop_guard(),
                 cancellation_token: token,
+                tasks: Default::default(),
                 announce_port: listen_result.as_ref().and_then(|l| l.announce_port),
                 listen_addr: listen_result.as_ref().map(|l| l.addr),
                 default_storage_factory: opts.default_storage_factory,
@@ -895,6 +903,7 @@ impl Session {
                 tracker_observer: opts.tracker_observer,
                 payload_budget: opts.payload_budget,
                 single_tracker_discovery: opts.single_tracker_discovery,
+                tracker_attempt: opts.tracker_attempt,
                 observation_only: opts.observation_only,
                 metadata_size_limit: opts.metadata_size_limit.clamp(1, 32 * 1024 * 1024),
                 peer_limit: opts.peer_limit,
@@ -1145,14 +1154,21 @@ impl Session {
         name: impl Into<Cow<'static, str>>,
         fut: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
     ) {
-        spawn_with_cancel(span, name, self.cancellation_token.clone(), fut);
+        if self.cancellation_token.is_cancelled() {
+            return;
+        }
+        if let Some(fut) = self.tasks.track(fut) {
+            spawn_with_cancel(span, name, self.cancellation_token.clone(), fut);
+        }
     }
 
     pub(crate) fn rs(&self) -> Option<tracing::Id> {
         self.root_span.as_ref().and_then(|s| s.id())
     }
 
-    /// Stop the session and all managed tasks.
+    /// Stop and drain spawned session, initialization and peer tasks.
+    /// Callers must first drop in-progress add_torrent/metadata-resolution futures,
+    /// which they own. A stopped session cannot be reused for new work.
     pub async fn stop(&self) {
         let torrents = self
             .db
@@ -1167,8 +1183,8 @@ impl Session {
             }
         }
         self.cancellation_token.cancel();
-        // this sucks, but hopefully will be enough
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        self.tasks.close();
+        self.tasks.wait().await;
     }
 
     /// Run a callback given the currently managed torrents.
@@ -1187,6 +1203,9 @@ impl Session {
         opts: Option<AddTorrentOptions>,
     ) -> BoxFuture<'a, anyhow::Result<AddTorrentResponse>> {
         async move {
+            if self.cancellation_token.is_cancelled() {
+                bail!("session is stopped");
+            }
             let mut opts = opts.unwrap_or_default();
             if self.observation_only {
                 opts.only_files = Some(Vec::new());
@@ -1371,16 +1390,33 @@ impl Session {
                         )
                         .await?;
 
-                    // Add back seen_peers into the peer stream, as we consumed some peers
-                    // while resolving the magnet.
-                    seen_peers = resolved_magnet.seen_peers.clone();
-                    let peer_rx = Some(
-                        merge_streams(
-                            resolved_magnet.peer_rx,
-                            futures::stream::iter(resolved_magnet.seen_peers),
+                    // Metadata resolution drops all in-flight metadata connections on return.
+                    // A private result must never inherit an unknown-privacy discovery
+                    // stream or its DHT/LSD/initial peer history.
+                    let peer_rx = if resolved_magnet.metadata.info.info().private {
+                        drop(resolved_magnet.peer_rx);
+                        if opts.paused || opts.list_only {
+                            None
+                        } else {
+                            self.make_peer_rx(
+                                info_hash,
+                                trackers.clone(),
+                                true,
+                                opts.force_tracker_interval,
+                                Vec::new(),
+                                true,
+                            )
+                        }
+                    } else {
+                        seen_peers = resolved_magnet.seen_peers.clone();
+                        Some(
+                            merge_streams(
+                                resolved_magnet.peer_rx,
+                                futures::stream::iter(resolved_magnet.seen_peers),
+                            )
+                            .boxed(),
                         )
-                        .boxed(),
-                    );
+                    };
                     (resolved_magnet.metadata, peer_rx)
                 }
             }
@@ -1651,7 +1687,9 @@ impl Session {
         initial_peers: Vec<SocketAddr>,
         is_private: bool,
     ) -> Option<PeerStream> {
-        let dht_rx = if is_private {
+        let restricted =
+            is_private || self.single_tracker_discovery || self.tracker_attempt.is_some();
+        let dht_rx = if restricted {
             None
         } else {
             self.dht.as_ref().map(|dht| {
@@ -1659,7 +1697,7 @@ impl Session {
             })
         };
 
-        let lsd_rx = if is_private {
+        let lsd_rx = if restricted {
             None
         } else {
             self.lsd.as_ref().map(|lsd| {
@@ -1671,11 +1709,29 @@ impl Session {
             trackers.clear();
         }
 
-        if !is_private && !self.single_tracker_discovery && !self.disable_trackers {
+        if !restricted && !self.disable_trackers {
             trackers.extend(self.trackers.iter().cloned());
         }
-        let trackers =
-            ordered_discovery_trackers(trackers, is_private || self.single_tracker_discovery);
+        if let Some(attempt) = self.tracker_attempt.as_ref() {
+            // Membership is checked against the complete original source list,
+            // never against session fallback trackers or a rewritten metainfo.
+            return (!self.disable_trackers && trackers.contains(&attempt.url)).then(|| {
+                TrackerComms::start_attempt(
+                    info_hash,
+                    self.peer_id,
+                    attempt.clone(),
+                    Box::new(PeerRxTorrentInfo {
+                        info_hash,
+                        session: self.clone(),
+                    }),
+                    self.announce_port().unwrap_or(4240),
+                    self.reqwest_client.clone(),
+                    self.udp_tracker_client.clone(),
+                    self.tracker_observer.clone(),
+                )
+            });
+        }
+        let trackers = ordered_discovery_trackers(trackers, restricted);
 
         let tracker_rx_stats = PeerRxTorrentInfo {
             info_hash,
@@ -1693,7 +1749,7 @@ impl Session {
             self.tracker_observer.clone(),
         );
 
-        let initial_peers_rx = if initial_peers.is_empty() {
+        let initial_peers_rx = if restricted || initial_peers.is_empty() {
             None
         } else {
             Some(futures::stream::iter(initial_peers))
@@ -2015,3 +2071,76 @@ mod catalog_private_tracker_tests {
         assert_eq!(selected[0].host_str(), Some("first.example"));
     }
 }
+
+#[cfg(test)]
+mod catalog_discovery_fencing_tests {
+    use super::*;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_waits_until_inflight_task_is_dropped() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            temp.path().into(),
+            SessionOptions {
+                dht: None,
+                disable_local_service_discovery: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct SlowDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for SlowDrop {
+            fn drop(&mut self) {
+                std::thread::sleep(Duration::from_millis(1400));
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let guard = SlowDrop(dropped.clone());
+        session.spawn(tracing::Span::none(), "owned old peer", async move {
+            let _guard = guard;
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        started_rx.await.unwrap();
+        session.stop().await;
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "stop returned before old peer task released its resources"
+        );
+    }
+
+    #[tokio::test]
+    async fn private_discovery_never_uses_unverified_initial_peers() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = Session::new_with_opts(
+            temp.path().into(),
+            SessionOptions {
+                dht: None,
+                disable_local_service_discovery: true,
+                disable_trackers: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let stream = session.make_peer_rx(
+            Id20::new([3; 20]),
+            vec![],
+            false,
+            None,
+            vec!["127.0.0.1:12345".parse().unwrap()],
+            true,
+        );
+        assert!(
+            stream.is_none(),
+            "private torrent admitted a peer not returned by its tracker"
+        );
+        session.stop().await;
+    }
+}
+
+#[cfg(test)]
+mod catalog_fencing_tests;

@@ -177,3 +177,17 @@ never refunds retries or preempted requests. The cap bounds the sum of solicited
 payload lengths; it does not count tracker messages, protocol overhead, or
 unsolicited network bytes. A failed reservation cancels the session. This is
 not a replacement for an embedder's process, disk, memory or network sandbox.
+
+## Bounded catalog tracker discovery
+
+`TrackerDiscoveryPlan::new(Vec<Vec<Url>>)` prepares a single pass through the original announce tiers: it shuffles within each tier, deduplicates URLs, and exhausts a tier before the next. A nonempty announce-list takes precedence over announce. Magnet `tr` parameters have no tier information; callers can represent them as ordered singleton tiers. Keep the original metainfo bytes and credentials; the plan is a discovery view, not a replacement metainfo.
+
+Set `SessionOptions::tracker_attempt = Some(TrackerAttempt { url, timeout })` for a catalog attempt. The selected URL must occur in the torrent's original tracker list. This mode performs one bounded HTTP/HTTPS/UDP announce, including DNS and body reading, with no background announce retries. The tracker observer is unchanged: success (including zero peers) is distinct from failure; cancellation before a response produces no observation. Tracker announce diagnostics use scheme, host and port only.
+
+This mode uses tracker peers exclusively, including while magnet privacy is unknown. It excludes DHT/LSD/PEX and injected initial peers. Ordinary public sessions keep their existing initial-peer behavior. When unknown metadata resolves to private, its former discovery stream and seen-peer history are discarded.
+
+For failover, first drop the attempt's caller-owned add/metadata/media futures, then await `Session::stop()`, then drop the session. Stop closes task admission and waits for spawned initialization, peer connections, peer queues and retry timers to release their resources. Only after successful teardown may a new session use the next tracker. A stopped session is not reusable. A timeout while draining must end the operation, never advance to a new tracker.
+
+A catalog caller should hold one overall deadline and one shared `PayloadBudget` across attempts. Advance only on an observed tracker failure; a valid response with zero peers or unusable peers is not permission to switch a private tracker. Exhausting failed candidates is an explicit tracker error, not evidence of zero availability.
+
+This API is for bounded one-shot catalog analysis. It does not add long-lived desktop multitracker monitoring or change the default tracker's periodic retry policy. No live-network performance or private-tracker interoperability claim is implied by loopback tests. Protocol references: [BEP 12](https://www.bittorrent.org/beps/bep_0012.html) and [BEP 27](https://www.bittorrent.org/beps/bep_0027.html).

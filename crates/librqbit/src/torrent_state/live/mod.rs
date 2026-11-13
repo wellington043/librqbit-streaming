@@ -258,6 +258,7 @@ pub struct TorrentStateLive {
 
     down_speed_estimator: SpeedEstimator,
     up_speed_estimator: SpeedEstimator,
+    tasks: crate::spawn_utils::TaskGroup,
     cancellation_token: CancellationToken,
 
     session_stats: Arc<SessionStats>,
@@ -362,6 +363,7 @@ impl TorrentStateLive {
             finished_notify: Notify::new(),
             down_speed_estimator,
             up_speed_estimator,
+            tasks: session.tasks.clone(),
             cancellation_token,
             have_broadcast_tx,
             session_stats,
@@ -424,7 +426,12 @@ impl TorrentStateLive {
         name: impl Into<Cow<'static, str>>,
         fut: impl std::future::Future<Output = crate::Result<()>> + Send + 'static,
     ) {
-        spawn_with_cancel(span, name, self.cancellation_token.clone(), fut);
+        if self.cancellation_token.is_cancelled() {
+            return;
+        }
+        if let Some(fut) = self.tasks.track(fut) {
+            spawn_with_cancel(span, name, self.cancellation_token.clone(), fut);
+        }
     }
 
     pub fn down_speed_estimator(&self) -> &SpeedEstimator {
@@ -836,6 +843,15 @@ impl TorrentStateLive {
                 aframe!(state.clone().task_manage_outgoing_peer(entry, permit)),
             );
         }
+    }
+
+    fn pex_allowed(&self) -> bool {
+        !self.metadata.info.info().private
+            && self
+                .shared
+                .session
+                .upgrade()
+                .is_some_and(|s| s.tracker_attempt.is_none())
     }
 
     pub fn torrent(&self) -> &ManagedTorrentShared {
@@ -1410,7 +1426,14 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             }
         }
 
-        if !self.state.metadata.info.info().private && hs.m.ut_pex.is_some() {
+        if self.state.pex_allowed()
+            && hs.m.ut_pex.is_some()
+            && let Some(task) = self.state.tasks.track(
+                self.state
+                    .clone()
+                    .task_send_pex_to_peer(self.addr, self.tx.clone()),
+            )
+        {
             spawn_with_cancel(
                 debug_span!(
                     parent: self.state.shared.span.clone(),
@@ -1422,9 +1445,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                     self.state.shared.id, self.addr
                 ),
                 self.cancel_token.clone(),
-                self.state
-                    .clone()
-                    .task_send_pex_to_peer(self.addr, self.tx.clone()),
+                task,
             );
         }
         // Lets update outgoing Socket address for incoming connection
@@ -1469,6 +1490,9 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         &self,
         handshake: &mut ExtendedHandshake<ByteBuf>,
     ) -> anyhow::Result<()> {
+        if !self.state.pex_allowed() {
+            handshake.m.ut_pex = None;
+        }
         let info_bytes = &self.state.metadata.info_bytes;
         if !info_bytes.is_empty()
             && let Ok(len) = info_bytes.len().try_into()
@@ -2619,6 +2643,9 @@ impl PeerHandler {
     }
 
     fn on_pex_message(&self, msg: UtPex<ByteBuf<'_>>) {
+        if !self.state.pex_allowed() {
+            return;
+        }
         msg.dropped_peers()
             .chain(msg.added_peers())
             .for_each(|peer| {

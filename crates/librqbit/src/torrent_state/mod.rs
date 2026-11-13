@@ -382,50 +382,55 @@ impl ManagedTorrent {
                     let span = t.shared().span.clone();
                     let token = token.clone();
 
-                    spawn_with_cancel(
-                        debug_span!(parent: span.clone(), "initialize_and_start"),
-                        "initialize_and_start",
-                        token.clone(),
-                        async move {
-                            let concurrent_init_semaphore =
-                                session.concurrent_initialize_semaphore.clone();
-                            let _permit = concurrent_init_semaphore
-                                .acquire()
-                                .await
-                                .context("bug: concurrent init semaphore was closed")?;
+                    let tasks = session.tasks.clone();
+                    let task_token = token.clone();
+                    let Some(task) = tasks.track(async move {
+                        let concurrent_init_semaphore =
+                            session.concurrent_initialize_semaphore.clone();
+                        let _permit = concurrent_init_semaphore
+                            .acquire()
+                            .await
+                            .context("bug: concurrent init semaphore was closed")?;
 
-                            let check_result = init.check().await;
-                            init.finish_check();
+                        let check_result = init.check().await;
+                        init.finish_check();
 
-                            match check_result {
-                                Ok(paused) => {
-                                    let mut g = t.locked.write();
-                                    if let ManagedTorrentState::Initializing(_) = &g.state {
-                                    } else {
-                                        debug!(
-                                            "no need to start torrent anymore, as it switched state from initializing"
-                                        );
-                                        return Ok(());
-                                    }
-
-                                    g.state = ManagedTorrentState::Paused(paused);
-                                    t.state_change_notify.notify_waiters();
-                                    _start(&t, peer_rx, start_paused, session, Some(g), token)
+                        match check_result {
+                            Ok(paused) => {
+                                let mut g = t.locked.write();
+                                if let ManagedTorrentState::Initializing(_) = &g.state {
+                                } else {
+                                    debug!(
+                                        "no need to start torrent anymore, as it switched state from initializing"
+                                    );
+                                    return Ok(());
                                 }
-                                Err(err) => {
-                                    if init.is_pause_requested() {
-                                        debug!("initial check paused");
-                                        t.state_change_notify.notify_waiters();
-                                        return Ok(());
-                                    }
 
-                                    let result = anyhow::anyhow!("{:?}", err);
-                                    t.locked.write().state = ManagedTorrentState::Error(err);
-                                    t.state_change_notify.notify_waiters();
-                                    Err(result)
-                                }
+                                g.state = ManagedTorrentState::Paused(paused);
+                                t.state_change_notify.notify_waiters();
+                                _start(&t, peer_rx, start_paused, session, Some(g), token)
                             }
-                        },
+                            Err(err) => {
+                                if init.is_pause_requested() {
+                                    debug!("initial check paused");
+                                    t.state_change_notify.notify_waiters();
+                                    return Ok(());
+                                }
+
+                                let result = anyhow::anyhow!("{:?}", err);
+                                t.locked.write().state = ManagedTorrentState::Error(err);
+                                t.state_change_notify.notify_waiters();
+                                Err(result)
+                            }
+                        }
+                    }) else {
+                        bail!("session is stopped");
+                    };
+                    spawn_with_cancel(
+                        debug_span!(parent: span, "initialize_and_start"),
+                        "initialize_and_start",
+                        task_token,
+                        task,
                     );
                     Ok(())
                 }

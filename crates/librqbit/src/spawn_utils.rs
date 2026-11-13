@@ -56,3 +56,38 @@ impl BlockingSpawner {
         self.concurrent_block_in_place_semaphore.clone()
     }
 }
+
+/// Session-owned tasks with admission closed atomically before a drain.
+/// Unlike TaskTracker alone, a closed group cannot accept new work.
+#[derive(Clone, Default)]
+pub(crate) struct TaskGroup {
+    inner: Arc<TaskGroupInner>,
+}
+#[derive(Default)]
+struct TaskGroupInner {
+    tracker: tokio_util::task::TaskTracker,
+    admission: parking_lot::Mutex<()>,
+}
+impl TaskGroup {
+    pub(crate) fn track<F: std::future::Future>(
+        &self,
+        future: F,
+    ) -> Option<impl std::future::Future<Output = F::Output> + use<F>> {
+        let _gate = self.inner.admission.lock();
+        if self.inner.tracker.is_closed() {
+            return None;
+        }
+        Some(self.inner.tracker.track_future(future))
+    }
+    pub(crate) fn close(&self) {
+        let _gate = self.inner.admission.lock();
+        self.inner.tracker.close();
+    }
+    pub(crate) async fn wait(&self) {
+        self.inner.tracker.wait().await;
+    }
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.inner.tracker.len()
+    }
+}

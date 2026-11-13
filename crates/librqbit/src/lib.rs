@@ -115,7 +115,9 @@ pub use clone_to_owned::CloneToOwned;
 pub use librqbit_core::magnet::*;
 pub use librqbit_core::peer_id::*;
 pub use librqbit_core::torrent_metainfo::*;
-pub use tracker_comms::{TrackerObservation, TrackerObserver};
+pub use tracker_comms::{
+    TrackerAttempt, TrackerDiscoveryPlan, TrackerObservation, TrackerObserver,
+};
 
 #[cfg(test)]
 mod tests;
@@ -130,7 +132,7 @@ pub const fn client_name_and_version() -> &'static str {
 }
 
 /// Local source revision. The protocol and upstream package version remain 9.1.0.
-pub const LOCAL_REVISION: &str = "librqbit-streaming.3";
+pub const LOCAL_REVISION: &str = "librqbit-streaming.4";
 
 pub fn try_increase_nofile_limit() -> anyhow::Result<u64> {
     Ok(rlimit::increase_nofile_limit(1024 * 1024)?)
@@ -140,6 +142,6 @@ pub fn try_increase_nofile_limit() -> anyhow::Result<u64> {
 mod catalog_revision_contract {
     #[test]
     fn exposes_streaming_revision_three() {
-        assert_eq!(crate::LOCAL_REVISION, "librqbit-streaming.3");
+        assert_eq!(crate::LOCAL_REVISION, "librqbit-streaming.4");
     }
 }
