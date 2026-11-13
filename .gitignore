@@ -9,3 +9,6 @@
 .claude
 .serena/
 node_modules
+
+# Internal execution plans and agent workflow notes stay local.
+/docs/superpowers/
