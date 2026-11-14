@@ -32,11 +32,17 @@ shipping application. Consumers should pin a reviewed commit.
 
 ## Verification
 
-Use focused tests for each change and the consolidated library workflow before
-publishing. Performance comparisons use this fork's earlier reviewed Rust
-revision, never the former JavaScript engine. Do not equate a scheduler unit test
-or local transfer with first-frame latency in a player or performance in a public
-swarm. Keep test media generated locally and network tests on loopback.
+The library workflow runs for source changes on `codex/streaming-*` and
+`streaming`, for pull requests, and on manual dispatch. Before tagging a release,
+verify the workflow against the exact commit to be tagged. Record the full commit
+SHA, Cargo package version, `LOCAL_REVISION`, and validation results in the
+release. Commit pins keep a consumer's source selection independent of branch
+updates. Tags identify commits that already passed the workflow.
+
+Use focused tests for each change. Compare performance with an earlier reviewed
+Rust revision of this fork. Report the fixture, platform, build profile, and
+the work performed per sample so the results can be interpreted accurately.
+Keep test media generated locally and network tests on loopback.
 
 Preserve ordinary download and seeding behavior outside the streaming opt-in.
 Check every scheduling path when changing demand rules, including stealing,

@@ -6,16 +6,26 @@ generated payload and loopback peers. No public torrent or player is needed.
 ## Commands
 
 ```sh
-cargo check --locked -p librqbit --no-default-features --features rust-tls,http-api,http-api-client,postgres --all-targets
+cargo check --locked -p librqbit --no-default-features --features rust-tls,http-api,http-api-client --all-targets
 cargo clippy --locked -p librqbit --no-default-features --features rust-tls --all-targets
-cargo test --locked -p librqbit --no-default-features --features rust-tls -- --test-threads=1
-cargo build --locked --release -p librqbit --no-default-features --features rust-tls
+cargo test --locked -p librqbit --no-default-features --features rust-tls --lib torrent_state::streaming
+cargo test --locked -p librqbit --no-default-features --features rust-tls --lib torrent_state::live::priority_tests
+cargo test --locked -p librqbit --no-default-features --features rust-tls --lib reclaim_transaction_rejects_checkpoint_failure_and_pins_active_reader
+cargo test --locked -p librqbit --no-default-features --features rust-tls --lib storage::filesystem::sparse::tests
+cargo test --locked -p librqbit --no-default-features --features rust-tls --lib catalog_revision_contract
+cargo test --locked -p librqbit --no-default-features --features rust-tls --test streaming_contract
 ```
 
-The inherited end-to-end tests were bounded with `E2E_NUM_SERVERS=4` and
-`E2E_TIMEOUT=180`. Tests requiring an external torrent client remain ignored.
-The new external API contract uses ephemeral loopback ports, two peers with
-different upload limits, verified bytes, seek generations and a peer stopping.
+The workflow runs these host commands on Linux and Windows. The external API
+contract uses ephemeral loopback ports, two peers with different upload limits,
+verified bytes, seek generations and a peer stopping. The Android job runs
+`cargo check --locked -p librqbit --no-default-features --features rust-tls --target armv7-linux-androideabi`
+using NDK r29 and API 26. It checks the library's target-specific source and native
+dependencies. Installation, JNI integration and playback require their own checks.
+
+A full library test or release build can still be run separately. The historical
+end-to-end test run used `E2E_NUM_SERVERS=4` and `E2E_TIMEOUT=180`. Tests requiring
+an external torrent client are ignored.
 
 ## Local results, 2026-11-12
 
@@ -77,11 +87,10 @@ first-frame latency, HDR, Android support or production PostgreSQL behavior.
 The HTTP adapter and the PostgreSQL persistence code were compile-checked as
 optional features; live database behavior requires its own environment.
 
-## Linux CI
+## Historical Linux CI
 
 [Streaming library run 43319303129](https://github.com/wellington043/librqbit-streaming/actions/runs/43319303129)
 passed on source commit `5db5a8079ebf3e7911019c835ea049bbc3fab906`:
 optional HTTP compilation, Clippy, library/external/documentation tests and the
 minimal release build. PostgreSQL was covered by the local compile above, not
-by this Linux workflow. Subsequent publication-evidence changes are documentation
-only and do not require another source test run.
+by that Linux workflow.

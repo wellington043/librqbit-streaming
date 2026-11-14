@@ -154,6 +154,32 @@ async fn reply(socket: &mut tokio::net::TcpStream, body: &[u8]) {
     socket.write_all(body).await.unwrap();
 }
 
+async fn read_tracker_request(socket: &mut tokio::net::TcpStream) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut request = [0; 4096];
+        let mut used = 0;
+        while used < request.len() {
+            let received = socket.read(&mut request[used..]).await.unwrap();
+            assert_ne!(
+                received, 0,
+                "tracker connection closed before request headers"
+            );
+            let previous = used;
+            used += received;
+            if request[previous.saturating_sub(3)..used]
+                .windows(4)
+                .any(|window| window == b"\r\n\r\n")
+            {
+                assert!(request[..used].starts_with(b"GET "));
+                return;
+            }
+        }
+        panic!("tracker request headers exceeded the fixture buffer");
+    })
+    .await
+    .expect("tracker request headers did not arrive");
+}
+
 #[tokio::test]
 async fn continuous_private_failover_drains_socket_and_discards_queued_old_peer() {
     let first_tracker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -189,18 +215,16 @@ async fn continuous_private_failover_drains_socket_and_discards_queued_old_peer(
     });
     let first_task = tokio::spawn(async move {
         let (mut socket, _) = first_tracker.accept().await.unwrap();
-        let mut request = [0; 4096];
-        socket.read(&mut request).await.unwrap();
+        read_tracker_request(&mut socket).await;
         reply(&mut socket, &first_body).await;
         drop(socket);
         let (mut socket, _) = first_tracker.accept().await.unwrap();
-        socket.read(&mut request).await.unwrap();
+        read_tracker_request(&mut socket).await;
         socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
     });
     let second_task = tokio::spawn(async move {
         let (mut socket, _) = second_tracker.accept().await.unwrap();
-        let mut request = [0; 4096];
-        socket.read(&mut request).await.unwrap();
+        read_tracker_request(&mut socket).await;
         tokio::time::timeout(Duration::from_secs(1), closed_rx)
             .await
             .expect("old socket was not drained before new peers")
@@ -263,8 +287,7 @@ async fn private_tracker_failure_advances_to_next_tier() {
         .to_vec();
     let first_task = tokio::spawn(async move {
         let (mut s, _) = first.accept().await.unwrap();
-        let mut b = [0; 2048];
-        s.read(&mut b).await.unwrap();
+        read_tracker_request(&mut s).await;
         s.write_all(
             b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         )
@@ -273,8 +296,7 @@ async fn private_tracker_failure_advances_to_next_tier() {
     });
     let second_task = tokio::spawn(async move {
         let (mut s, _) = second.accept().await.unwrap();
-        let mut b = [0; 2048];
-        s.read(&mut b).await.unwrap();
+        read_tracker_request(&mut s).await;
         let body = b"d8:intervali60e5:peers6:\x7f\x00\x00\x01\x1a\xe1e";
         s.write_all(
             format!(

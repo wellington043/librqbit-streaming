@@ -132,7 +132,7 @@ pub const fn client_name_and_version() -> &'static str {
 }
 
 /// Local source revision. The protocol and upstream package version remain 9.1.0.
-pub const LOCAL_REVISION: &str = "librqbit-streaming.5";
+pub const LOCAL_REVISION: &str = "librqbit-streaming.6";
 
 pub fn try_increase_nofile_limit() -> anyhow::Result<u64> {
     Ok(rlimit::increase_nofile_limit(1024 * 1024)?)
@@ -142,6 +142,7 @@ pub fn try_increase_nofile_limit() -> anyhow::Result<u64> {
 mod catalog_revision_contract {
     #[test]
     fn exposes_current_streaming_revision() {
-        assert_eq!(crate::LOCAL_REVISION, "librqbit-streaming.5");
+        assert_eq!(crate::version(), "9.1.0");
+        assert_eq!(crate::LOCAL_REVISION, "librqbit-streaming.6");
     }
 }

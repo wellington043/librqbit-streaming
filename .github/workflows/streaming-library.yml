@@ -2,7 +2,7 @@ name: Streaming library
 
 on:
   push:
-    branches: ["codex/streaming-foundation", "streaming"]
+    branches: ["codex/streaming-*", "streaming"]
     paths:
       - "crates/**"
       - "Cargo.toml"
@@ -21,24 +21,75 @@ concurrency:
 
 jobs:
   library:
-    # Windows is checked locally before publication; CI adds a Linux check.
-    runs-on: ubuntu-latest
+    name: Library (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
-      E2E_NUM_SERVERS: "4"
-      E2E_TIMEOUT: "180"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.100.0"
-          components: rustfmt, clippy
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup show
       - uses: Swatinem/rust-cache@v2
       - name: Check minimal and optional HTTP APIs
         run: cargo check --locked -p librqbit --no-default-features --features rust-tls,http-api,http-api-client --all-targets
       - name: Lint library
         run: cargo clippy --locked -p librqbit --no-default-features --features rust-tls --all-targets
-      - name: Library and external streaming contracts
-        run: cargo test --locked -p librqbit --no-default-features --features rust-tls -- --test-threads=1
+      - name: External streaming contract
+        run: cargo test --locked -p librqbit --no-default-features --features rust-tls --test streaming_contract
+      - name: Streaming policy unit tests
+        run: cargo test --locked -p librqbit --no-default-features --features rust-tls --lib torrent_state::streaming
+      - name: Priority and preemption contracts
+        run: cargo test --locked -p librqbit --no-default-features --features rust-tls --lib torrent_state::live::priority_tests
+      - name: Reclamation transaction contract
+        run: cargo test --locked -p librqbit --no-default-features --features rust-tls --lib reclaim_transaction_rejects_checkpoint_failure_and_pins_active_reader
+      - name: Sparse file reclamation tests
+        run: cargo test --locked -p librqbit --no-default-features --features rust-tls --lib storage::filesystem::sparse::tests
+      - name: Fork revision contract
+        run: cargo test --locked -p librqbit --no-default-features --features rust-tls --lib catalog_revision_contract
       - name: Build minimal release library
+        if: runner.os == 'Linux' && github.ref == 'refs/heads/streaming'
         run: cargo build --locked --release -p librqbit --no-default-features --features rust-tls
+
+  android:
+    name: Android ARMv7 library
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain and Android target
+        run: |
+          rustup show
+          rustup target add armv7-linux-androideabi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-armv7-api26
+      - name: Cross-check minimal Android library
+        shell: bash
+        run: |
+          ndk="$ANDROID_HOME/ndk/29.0.14206865"
+          if [ ! -d "$ndk" ]; then
+            sdkmanager "ndk;29.0.14206865"
+          fi
+          llvm="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          compiler="$llvm/armv7a-linux-androideabi26-clang"
+          test -x "$compiler"
+          export ANDROID_NDK_HOME="$ndk"
+          export ANDROID_NDK_ROOT="$ndk"
+          export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER="$compiler"
+          export CC_armv7_linux_androideabi="$compiler"
+          export CXX_armv7_linux_androideabi="$compiler++"
+          export AR_armv7_linux_androideabi="$llvm/llvm-ar"
+          export RANLIB_armv7_linux_androideabi="$llvm/llvm-ranlib"
+          export AWS_LC_SYS_CMAKE_BUILDER=0
+          cargo check --locked -p librqbit --no-default-features --features rust-tls --target armv7-linux-androideabi

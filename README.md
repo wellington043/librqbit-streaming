@@ -2,7 +2,7 @@
 
 A streaming-focused Rust library fork of [rqbit](https://github.com/ikatson/rqbit), based on librqbit 9.1.0. The library supplies verified torrent bytes to a media application. It does not include a player, codec implementation or transcoder.
 
-This is an experimental fork. The first milestone focuses on library APIs, correctness and local multi-peer transfers. Public-swarm performance, mobile support and player integration require separate validation.
+This is an experimental fork. Local validation uses generated payloads and loopback peers. Public-swarm performance and player integration require separate validation.
 
 ## Streaming features
 
@@ -29,18 +29,18 @@ Rust 1.100.0 is pinned in `rust-toolchain.toml`.
 
 ```sh
 cargo build --locked --release -p librqbit --no-default-features --features rust-tls
-cargo test --locked -p librqbit --no-default-features --features rust-tls -- --test-threads=1
+cargo test --locked -p librqbit --no-default-features --features rust-tls --test streaming_contract
 ```
 
-The default workspace selects the library. The minimal build excludes the HTTP server adapters, web UI, desktop, database adapter and optional metrics exporter. TCP, uTP, DHT, trackers and hash verification remain available. Optional adapters can still be explicitly enabled. The upstream desktop release workflows were removed from this fork; CI validates the library.
+The default workspace selects the library. The minimal build excludes the HTTP server adapters, web UI, desktop, database adapter and optional metrics exporter. TCP, uTP, DHT, trackers and hash verification remain available. Optional adapters can still be explicitly enabled. The library workflow covers Linux and Windows host checks and an Android ARMv7 compile check.
 
-Applications should pin a reviewed Git commit from this fork and use `default-features = false, features = ["rust-tls"]`. The upstream package version remains 9.1.0; `librqbit::LOCAL_REVISION` identifies this fork's API revision. This repository does not publish under the upstream crate's crates.io identity.
+Applications should pin a reviewed Git commit from this fork and use `default-features = false, features = ["rust-tls"]`. Cargo reports the upstream package version 9.1.0. The fork reports `librqbit-streaming.6` through `librqbit::LOCAL_REVISION`. Consumers should record the full Git SHA alongside the runtime revision. This repository does not publish under the upstream crate's crates.io identity.
 
-The first validated streaming source revision can be consumed with:
+Set `LIBRQBIT_COMMIT` to the full commit SHA from the
+[release](https://github.com/wellington043/librqbit-streaming/releases) you choose.
 
-```toml
-[dependencies]
-librqbit = { git = "https://github.com/wellington043/librqbit-streaming", rev = "5db5a8079ebf3e7911019c835ea049bbc3fab906", default-features = false, features = ["rust-tls"] }
+```sh
+cargo add --git https://github.com/wellington043/librqbit-streaming --rev "$LIBRQBIT_COMMIT" --no-default-features --features rust-tls librqbit
 ```
 
 ## Documentation

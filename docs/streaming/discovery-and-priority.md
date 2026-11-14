@@ -1,7 +1,8 @@
 # Discovery state and payload priority
 
-`librqbit-streaming.5` retains the upstream package version and the existing
-streaming interfaces. Consumers should pin the exact source commit.
+`librqbit-streaming.5` introduced the discovery and priority changes described
+here. The upstream package version is 9.1.0. Consumers should pin the exact
+source commit.
 
 ## Routing checkpoints
 

@@ -211,6 +211,19 @@ impl TorrentStreams {
         schedule: impl FnOnce(Option<&Demand>, &mut dyn Iterator<Item = ValidPieceIndex>) -> R,
     ) -> R {
         let mut state = self.state.lock();
+        let round = state.scheduling_round;
+        state.scheduling_round = round.wrapping_add(1);
+
+        // One contiguous window already yields unique pieces in order.
+        if state.streams.len() <= 1 {
+            let window = state.streams.values().next().map_or(0..0, |stream| {
+                stream.piece_window(state.reader_lookahead(stream), lengths)
+            });
+            let mut pieces = window.filter_map(|piece| lengths.validate_piece_index(piece));
+            let demand = state.policy.as_ref().map(|_| state.demand());
+            return schedule(demand.as_ref(), &mut pieces);
+        }
+
         let mut windows: Vec<_> = state
             .streams
             .iter()
@@ -237,7 +250,7 @@ impl TorrentStreams {
             // Deadline orders each round; rotating the starting reader preserves
             // fairness even if the caller consumes only one available piece.
             for group in windows.chunk_by_mut(|left, right| left.1.priority == right.1.priority) {
-                let offset = state.scheduling_round % group.len();
+                let offset = round % group.len();
                 group.rotate_left(offset);
                 groups.push_back(
                     group
@@ -253,7 +266,6 @@ impl TorrentStreams {
             groups.push_back(windows.iter().map(|(_, _, range)| range.clone()).collect());
         }
         drop(windows);
-        state.scheduling_round = state.scheduling_round.wrapping_add(1);
         let mut seen = HashSet::new();
         let mut pieces = std::iter::from_fn(|| {
             while let Some(windows) = groups.front_mut() {
@@ -1093,6 +1105,53 @@ mod tests {
         streams.drop_stream(0);
         assert_eq!(schedule(&streams), [0, 1]);
         assert_eq!(streams.snapshot().unwrap().demand_bytes, MIB);
+    }
+
+    #[test]
+    fn single_reader_schedules_exact_demand_and_preserves_round_rotation() {
+        let streams = TorrentStreams::new(true);
+        let lengths = Lengths::new(16 * MIB, u32::try_from(MIB).unwrap()).unwrap();
+        let acquire = |expected: Range<u64>| {
+            streams.with_scheduling(&lengths, |demand, pieces| {
+                let demand = demand.unwrap();
+                assert_eq!(demand.total_bytes(), expected.end - expected.start);
+                assert_eq!(demand.covered_bytes(expected), demand.total_bytes());
+                pieces.map(|piece| piece.get()).collect::<Vec<_>>()
+            })
+        };
+
+        assert!(acquire(0..0).is_empty());
+        add_reader(
+            &streams,
+            0,
+            MIB - 17..3 * MIB + 25,
+            StreamPriority::Playback,
+            None,
+        );
+        assert_eq!(acquire(MIB - 17..2 * MIB - 17), [0, 1]);
+        streams
+            .set_position(0, 3 * MIB + 7, true, &lengths)
+            .unwrap();
+        assert_eq!(acquire(3 * MIB + 7..3 * MIB + 25), [3]);
+
+        add_reader(
+            &streams,
+            1,
+            8 * MIB..8 * MIB + 9,
+            StreamPriority::Playback,
+            None,
+        );
+        streams.with_scheduling(&lengths, |demand, pieces| {
+            assert_eq!(demand.unwrap().total_bytes(), 27);
+            assert_eq!(pieces.map(|piece| piece.get()).collect::<Vec<_>>(), [8, 3]);
+        });
+        streams.drop_stream(0);
+        streams
+            .set_position(1, 8 * MIB + 9, false, &lengths)
+            .unwrap();
+        assert!(acquire(0..0).is_empty());
+        streams.drop_stream(1);
+        assert!(acquire(0..0).is_empty());
     }
 
     #[test]
