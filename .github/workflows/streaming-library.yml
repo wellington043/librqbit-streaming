@@ -37,25 +37,61 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
+      - name: Check Rust formatting
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+      - name: Record library dependency graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_TERM_COLOR=never
+          target="$(rustc -vV | sed -n 's/^host: //p')"
+          mkdir -p dependency-graph
+          {
+            printf 'commit=%s\ntarget=%s\nfeatures=rust-tls-minimal\n' "$GITHUB_SHA" "$target"
+            sha256sum Cargo.lock
+          } > dependency-graph/identity.txt
+          cargo tree --locked -p librqbit --no-default-features --features rust-tls-minimal --target "$target" -e normal,build -f '{p}|{f}' > dependency-graph/tree.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: library-dependency-graph-${{ runner.os }}
+          path: dependency-graph/
       - name: Check minimal and optional HTTP APIs
-        run: cargo check --locked -p librqbit --no-default-features --features rust-tls,http-api,http-api-client --all-targets
+        run: cargo check --locked -p librqbit --no-default-features --features rust-tls-minimal,http-api,http-api-client --all-targets
+      - name: Check optional protocol and storage profiles
+        if: runner.os == 'Linux'
+        run: cargo check --locked -p librqbit --no-default-features --features rust-tls-minimal,prometheus,http-api,upnp-serve-adapter,storage_examples --all-targets
       - name: Lint library
-        run: cargo clippy --locked -p librqbit --no-default-features --features rust-tls --all-targets
+        run: cargo clippy --locked -p librqbit --no-default-features --features rust-tls-minimal --all-targets
       - name: External streaming contract
-        run: cargo test --locked -p librqbit --no-default-features --features rust-tls --test streaming_contract
+        run: cargo test --locked -p librqbit --no-default-features --features rust-tls-minimal --test streaming_contract
+      - name: uTP transfer through both Rust TLS profiles
+        if: runner.os == 'Linux'
+        env:
+          E2E_NUM_SERVERS: 2
+        run: |
+          cargo test --locked -p librqbit --no-default-features --features rust-tls-minimal --lib test_e2e_download_utp
+          cargo test --locked -p librqbit --no-default-features --features rust-tls --lib test_e2e_download_utp
+      - name: Direct rate limiter
+        run: cargo test --locked -p librqbit --no-default-features --features rust-tls-minimal --lib limits::tests
       - name: Streaming policy unit tests
-        run: cargo test --locked -p librqbit --no-default-features --features rust-tls --lib torrent_state::streaming
+        run: cargo test --locked -p librqbit --no-default-features --features rust-tls-minimal --lib torrent_state::streaming
       - name: Priority and preemption contracts
-        run: cargo test --locked -p librqbit --no-default-features --features rust-tls --lib torrent_state::live::priority_tests
+        run: cargo test --locked -p librqbit --no-default-features --features rust-tls-minimal --lib torrent_state::live::priority_tests
       - name: Reclamation transaction contract
-        run: cargo test --locked -p librqbit --no-default-features --features rust-tls --lib reclaim_transaction_rejects_checkpoint_failure_and_pins_active_reader
-      - name: Sparse file reclamation tests
-        run: cargo test --locked -p librqbit --no-default-features --features rust-tls --lib storage::filesystem::sparse::tests
+        run: cargo test --locked -p librqbit --no-default-features --features rust-tls-minimal --lib reclaim_transaction_rejects_checkpoint_failure_and_pins_active_reader
+      - name: Positional I/O and sparse file reclamation
+        run: cargo test --locked -p librqbit --no-default-features --features rust-tls-minimal --lib storage::filesystem::
+      - name: UPnP parsing and rendering
+        if: runner.os == 'Linux'
+        run: |
+          cargo test --locked -p librqbit-upnp --lib test_parse_root_desc
+          cargo test --locked -p librqbit-upnp-serve --features librqbit-core/sha1-ring --lib content_directory::tests
       - name: Fork revision contract
-        run: cargo test --locked -p librqbit --no-default-features --features rust-tls --lib catalog_revision_contract
+        run: cargo test --locked -p librqbit --no-default-features --features rust-tls-minimal --lib catalog_revision_contract
       - name: Build minimal release library
         if: runner.os == 'Linux' && github.ref == 'refs/heads/streaming'
-        run: cargo build --locked --release -p librqbit --no-default-features --features rust-tls
+        run: cargo build --locked --release -p librqbit --no-default-features --features rust-tls-minimal
 
   android:
     name: Android ARMv7 library
@@ -92,4 +128,20 @@ jobs:
           export AR_armv7_linux_androideabi="$llvm/llvm-ar"
           export RANLIB_armv7_linux_androideabi="$llvm/llvm-ranlib"
           export AWS_LC_SYS_CMAKE_BUILDER=0
-          cargo check --locked -p librqbit --no-default-features --features rust-tls --target armv7-linux-androideabi
+          cargo check --locked -p librqbit --no-default-features --features rust-tls-minimal --target armv7-linux-androideabi
+      - name: Record Android dependency graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_TERM_COLOR=never
+          target=armv7-linux-androideabi
+          mkdir -p dependency-graph
+          {
+            printf 'commit=%s\ntarget=%s\nfeatures=rust-tls-minimal\n' "$GITHUB_SHA" "$target"
+            sha256sum Cargo.lock
+          } > dependency-graph/identity.txt
+          cargo tree --locked -p librqbit --no-default-features --features rust-tls-minimal --target "$target" -e normal,build -f '{p}|{f}' > dependency-graph/tree.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-armv7-dependency-graph
+          path: dependency-graph/
