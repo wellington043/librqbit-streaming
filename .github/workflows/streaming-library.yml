@@ -81,7 +81,7 @@ jobs:
       - name: Reclamation transaction contract
         run: cargo test --locked -p librqbit --no-default-features --features rust-tls-minimal --lib reclaim_transaction_rejects_checkpoint_failure_and_pins_active_reader
       - name: Positional I/O and sparse file reclamation
-        run: cargo test --locked -p librqbit --no-default-features --features rust-tls-minimal --lib storage::filesystem::
+        run: cargo test --locked -p librqbit --no-default-features --features rust-tls-minimal --lib storage::filesystem
       - name: UPnP parsing and rendering
         if: runner.os == 'Linux'
         run: |
