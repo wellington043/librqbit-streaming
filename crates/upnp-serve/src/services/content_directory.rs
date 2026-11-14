@@ -59,6 +59,8 @@ pub mod browse {
     }
 
     pub mod response {
+        use quick_xml::escape::escape;
+
         #[derive(Debug, Clone, PartialEq, Eq)]
         pub struct Container {
             pub id: usize,
@@ -102,9 +104,9 @@ pub mod browse {
                         id = item.id,
                         parent_id = item.parent_id,
                         mime_type = mime,
-                        url = item.url,
+                        url = escape(&item.url),
                         upnp_class = upnp_class,
-                        title = item.title,
+                        title = escape(&item.title),
                         size = item.size
                     ))
                 }
@@ -120,7 +122,7 @@ pub mod browse {
                         ),
                         id = item.id,
                         parent_id = item.parent_id.map(|p| p as isize).unwrap_or(-1),
-                        title = item.title,
+                        title = escape(&item.title),
                         childCountTag = child_count_tag
                     )
                 }
@@ -150,7 +152,7 @@ pub mod browse {
 
                 // This COULD have been done with CDATA, but some Samsung TVs don't like that, they want
                 // escaped XML instead.
-                let items_encoded = quick_xml::escape::escape(items_encoded);
+                let items_encoded = escape(items_encoded);
 
                 format!(
                     include_str!(
@@ -343,13 +345,113 @@ pub trait ContentDirectoryBrowseProvider: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use browse::{
+        request::{BrowseFlag, ContentDirectoryControlRequest},
+        response::{Container, Item, render},
+    };
+
+    const REQUEST: &str =
+        include_str!("../resources/test/ContentDirectoryControlExampleRequest.xml");
+
     #[test]
     fn test_parse_content_directory_request() {
-        use super::browse::request::{BrowseFlag, ContentDirectoryControlRequest};
-
-        let s = include_str!("../resources/test/ContentDirectoryControlExampleRequest.xml");
-        let req = ContentDirectoryControlRequest::parse(s).unwrap();
+        let req = ContentDirectoryControlRequest::parse(REQUEST).unwrap();
         assert_eq!(req.object_id, 5);
         assert_eq!(req.browse_flag, BrowseFlag::BrowseDirectChildren)
+    }
+
+    #[test]
+    fn test_parse_content_directory_request_rejects_truncation() {
+        let end = REQUEST.find("</BrowseFlag>").unwrap();
+        assert!(ContentDirectoryControlRequest::parse(&REQUEST[..end]).is_err());
+    }
+
+    #[tokio::test]
+    async fn content_directory_http_rejects_invalid_utf8() {
+        struct UnusedProvider;
+        impl ContentDirectoryBrowseProvider for UnusedProvider {
+            fn browse_direct_children(&self, _: usize, _: &str) -> Vec<ItemOrContainer> {
+                panic!("invalid input reached the provider");
+            }
+
+            fn browse_metadata(&self, _: usize, _: &str) -> Vec<ItemOrContainer> {
+                panic!("invalid input reached the provider");
+            }
+        }
+
+        let state = crate::state::UpnpServerStateInner::new(
+            Bytes::new(),
+            Box::new(UnusedProvider),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("host", http::HeaderValue::from_static("localhost"));
+        headers.insert(
+            "soapaction",
+            http::HeaderValue::from_bytes(SOAP_ACTION_CONTENT_DIRECTORY_BROWSE).unwrap(),
+        );
+        let mut request = REQUEST.as_bytes().to_vec();
+        request.extend_from_slice(&[0xff]);
+        let response = http_handler(headers, State(state), Bytes::from(request)).await;
+        assert_eq!(response.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn content_directory_response_escapes_values_in_both_xml_documents() {
+        #[derive(serde_derive::Deserialize)]
+        struct Envelope {
+            #[serde(rename = "Body")]
+            body: Body,
+        }
+
+        #[derive(serde_derive::Deserialize)]
+        struct Body {
+            #[serde(rename = "BrowseResponse")]
+            browse: Browse,
+        }
+
+        #[derive(serde_derive::Deserialize)]
+        struct Browse {
+            #[serde(rename = "Result")]
+            result: String,
+        }
+
+        #[derive(serde_derive::Deserialize)]
+        struct Didl {
+            container: DidlEntry,
+            item: DidlEntry,
+        }
+
+        #[derive(serde_derive::Deserialize)]
+        struct DidlEntry {
+            title: String,
+            res: Option<String>,
+        }
+
+        let title = "Living & Media <Archive>";
+        let url = "http://localhost/stream?a=1&b=2";
+        let response = render([
+            ItemOrContainer::Container(Container {
+                id: 0,
+                parent_id: None,
+                children_count: Some(1),
+                title: title.to_owned(),
+            }),
+            ItemOrContainer::Item(Item {
+                id: 1,
+                parent_id: 0,
+                title: title.to_owned(),
+                mime_type: Some("video/mp4".parse().unwrap()),
+                url: url.to_owned(),
+                size: 123,
+            }),
+        ]);
+        let soap: Envelope = quick_xml::de::from_str(&response).unwrap();
+        let didl: Didl = quick_xml::de::from_str(&soap.body.browse.result).unwrap();
+        assert_eq!(didl.container.title, title);
+        assert_eq!(didl.item.title, title);
+        assert_eq!(didl.item.res.as_deref(), Some(url));
     }
 }

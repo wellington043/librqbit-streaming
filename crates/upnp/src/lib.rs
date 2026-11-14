@@ -579,4 +579,19 @@ mod tests {
         };
         assert_eq!(actual, expected);
     }
+
+    #[test]
+    fn test_parse_root_desc_rejects_truncation() {
+        let description = include_str!("resources/test/devices-0.xml");
+        let end = description.find("</friendlyName>").unwrap();
+        assert!(from_str::<RootDesc>(&description[..end]).is_err());
+    }
+
+    #[test]
+    fn test_parse_root_desc_decodes_escaped_name() {
+        let description = include_str!("resources/test/devices-0.xml")
+            .replace("ARRIS TG3492LG", "Living &amp; Media &lt;Router&gt;");
+        let parsed = from_str::<RootDesc>(&description).unwrap();
+        assert_eq!(parsed.devices[0].friendly_name, "Living & Media <Router>");
+    }
 }
