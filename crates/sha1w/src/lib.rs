@@ -1,9 +1,7 @@
 // Wrapper for sha1/sha256 libraries to be able to swap them easily,
 // e.g. to measure performance, or change implementations depending on platform.
 //
-// Sha1 computation is the majority of CPU usage of librqbit.
-// openssl is 2-3x faster than rust's sha1.
-// system library is the best choice probably (it's the default anyway).
+// The public sha1-ring feature selects the AWS-LC backend for both digests.
 
 pub trait ISha1 {
     fn new() -> Self;
