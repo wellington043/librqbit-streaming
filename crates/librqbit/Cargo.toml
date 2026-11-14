@@ -24,10 +24,13 @@ default-tls = [
     "reqwest/default-tls",
     "sha1w/sha1-crypto-hash",
     "librqbit-core/sha1-crypto-hash",
+    "utp-metrics",
 ]
 miri = []
-prometheus = ["metrics-exporter-prometheus"]
-rust-tls = ["reqwest/rustls", "sha1w/sha1-ring", "librqbit-core/sha1-ring"]
+prometheus = ["metrics-exporter-prometheus", "utp-metrics"]
+rust-tls = ["rust-tls-minimal", "utp-metrics"]
+rust-tls-minimal = ["reqwest/rustls", "sha1w/sha1-ring", "librqbit-core/sha1-ring"]
+utp-metrics = ["librqbit-utp/export-metrics"]
 storage_middleware = ["lru"]
 storage_examples = ["dep:memmap2"]
 tracing-subscriber-utils = ["tracing-subscriber"]
@@ -103,7 +106,7 @@ walkdir.workspace = true
 arc-swap.workspace = true
 intervaltree.workspace = true
 async-compression = { workspace = true, features = ["tokio", "gzip"] }
-librqbit-utp = { workspace = true, features = ["export-metrics"] }
+librqbit-utp.workspace = true
 axum-extra = { workspace = true, features = ["query"], optional = true }
 librqbit-dualstack-sockets.workspace = true
 socket2.workspace = true

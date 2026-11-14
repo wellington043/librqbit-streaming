@@ -36,6 +36,8 @@ The default workspace selects the library. The minimal build excludes the HTTP s
 
 Applications should pin a reviewed Git commit from this fork and use `default-features = false, features = ["rust-tls"]`. Cargo reports the upstream package version 9.1.0. The fork reports `librqbit-streaming.6` through `librqbit::LOCAL_REVISION`. Consumers should record the full Git SHA alongside the runtime revision. This repository does not publish under the upstream crate's crates.io identity.
 
+`rust-tls-minimal` provides the same TLS and hash backends and keeps TCP and uTP. Choose `rust-tls` to also compile uTP metrics for an application recorder. `default-tls` and `prometheus` also enable `utp-metrics`.
+
 Set `LIBRQBIT_COMMIT` to the full commit SHA from the
 [release](https://github.com/wellington043/librqbit-streaming/releases) you choose.
 
