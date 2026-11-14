@@ -273,6 +273,33 @@ mod tests {
         });
     }
 
+    #[cfg(any(windows, target_os = "linux", target_os = "android"))]
+    #[test]
+    fn test_pwrite_all_vectored_above_4gib_preserves_neighbours() {
+        let file = tempfile::tempfile().unwrap();
+        #[cfg(windows)]
+        if !super::super::sparse::mark_file_sparse(&file) {
+            eprintln!("skipping large offset fixture: filesystem does not support sparse files");
+            return;
+        }
+
+        let offset = (1u64 << 32) + 4096;
+        file.pwrite_all(0, b"low").unwrap();
+        file.pwrite_all(offset - 1, b"L.....R").unwrap();
+        assert_eq!(
+            file.pwrite_all_vectored(offset, [IoSlice::new(b"ab"), IoSlice::new(b"cde")])
+                .unwrap(),
+            5
+        );
+        assert_eq!(file.metadata().unwrap().len(), offset + 6);
+        let mut low = [0; 3];
+        file.pread_exact(0, &mut low).unwrap();
+        assert_eq!(&low, b"low");
+        let mut high = [0; 7];
+        file.pread_exact(offset - 1, &mut high).unwrap();
+        assert_eq!(&high, b"LabcdeR");
+    }
+
     // 2 GiB is where a 32-bit off_t runs out. On a 64-bit host this still goes through
     // pwritev, so it cannot reproduce the 32-bit failure; on a 32-bit target the same
     // test takes the fallback.
