@@ -34,7 +34,7 @@ cargo test --locked -p librqbit --no-default-features --features rust-tls --test
 
 The default workspace selects the library. The minimal build excludes the HTTP server adapters, web UI, desktop, database adapter and optional metrics exporter. TCP, uTP, DHT, trackers and hash verification remain available. Optional adapters can still be explicitly enabled. The library workflow covers Linux and Windows host checks and an Android ARMv7 compile check.
 
-Applications should pin a reviewed Git commit from this fork and use `default-features = false, features = ["rust-tls"]`. Cargo reports the upstream package version 9.1.0. The fork reports `librqbit-streaming.6` through `librqbit::LOCAL_REVISION`. Consumers should record the full Git SHA alongside the runtime revision. This repository does not publish under the upstream crate's crates.io identity.
+Applications should pin a reviewed Git commit from this fork and use `default-features = false, features = ["rust-tls"]`. Cargo reports the upstream package version 9.1.0. The fork reports `librqbit-streaming.7` through `librqbit::LOCAL_REVISION`. Consumers should record the full Git SHA alongside the runtime revision. This repository does not publish under the upstream crate's crates.io identity.
 
 `rust-tls-minimal` provides the same TLS and hash backends and keeps TCP and uTP. Choose `rust-tls` to also compile uTP metrics for an application recorder. `default-tls` and `prometheus` also enable `utp-metrics`.
 
