@@ -97,3 +97,57 @@ impl Limits {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{pin::pin, task::Poll};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn direct_quota_applies_and_new_calls_see_the_replaced_limit() {
+        let one = NonZeroU32::MIN;
+        let two = NonZeroU32::new(2).unwrap();
+        let limits = Limits::new(LimitsConfig {
+            download_bps: Some(one),
+            upload_bps: Some(two),
+        });
+
+        assert!(matches!(
+            limits.prepare_for_download(two).await,
+            Err(crate::Error::RateLimitInsufficientCapacity(_))
+        ));
+        limits.prepare_for_upload(two).await.unwrap();
+
+        limits.set_download_bps(Some(two));
+        assert_eq!(limits.get_download_bps(), Some(two));
+        limits.prepare_for_download(two).await.unwrap();
+
+        limits.set_download_bps(None);
+        assert_eq!(limits.get_download_bps(), None);
+        assert_eq!(limits.get_upload_bps(), Some(two));
+        limits.prepare_for_download(NonZeroU32::MAX).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_pending_acquisition_releases_the_replaced_limiter() {
+        let one = NonZeroU32::MIN;
+        let limit = Limit::new(Some(one));
+        limit.acquire(one).await.unwrap();
+        let original = Arc::downgrade(&limit.limiter.load_full().unwrap());
+
+        {
+            let mut waiting = pin!(limit.acquire(one));
+            assert!(matches!(futures::poll!(waiting.as_mut()), Poll::Pending));
+
+            limit.set(None);
+            assert!(original.upgrade().is_some());
+            assert!(matches!(
+                futures::poll!(pin!(limit.acquire(one))),
+                Poll::Ready(Ok(()))
+            ));
+        }
+
+        assert!(original.upgrade().is_none());
+    }
+}

@@ -87,7 +87,7 @@ directories = "6"
 encoding_rs = "0.8"
 futures = "0.3"
 gethostname = "1"
-governor = "0.10"
+governor = { version = "0.10", default-features = false, features = ["std", "quanta"] }
 hex = "0.4"
 home = "0.5"
 http = "1"
